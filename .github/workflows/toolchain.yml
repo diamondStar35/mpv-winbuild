@@ -25,6 +25,16 @@ on:
         options:
         - gcc
         - clang
+      variant:
+        description: "MPV build variant"
+        required: false
+        default: "gpl"
+        type: choice
+        options:
+        - gpl
+        - lgpl
+        - lgpl-shared
+        - all
       no_save_cache:
         description: "Don't save caches after success build"
         required: false
@@ -269,6 +279,7 @@ jobs:
                   workflow_id: 'mpv.yml',
                   inputs: {
                     build_target: t,
+                    variant: "${{ inputs.variant }}",
                     compiler: "${{ inputs.compiler }}",
                     needclean: true,
                     release: release,

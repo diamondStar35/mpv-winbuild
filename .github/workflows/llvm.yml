@@ -31,6 +31,16 @@ on:
         - aarch64
         - all-64bit
         - all
+      variant:
+        description: "MPV build variant"
+        required: false
+        default: "gpl"
+        type: choice
+        options:
+        - gpl
+        - lgpl
+        - lgpl-shared
+        - all
       trigger_build:
         description: "Trigger mpv build action after toolchain build"
         required: false
@@ -155,6 +165,7 @@ jobs:
               workflow_id: 'toolchain.yml',
               inputs: {
                 build_target: "${{ inputs.build_target }}",
+                variant: "${{ inputs.variant }}",
                 compiler: "clang",
                 trigger_build: ${{ inputs.trigger_build }},
                 release: ${{ inputs.release }},

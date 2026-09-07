@@ -1,0 +1,61 @@
+From cd96669ef2a7605752021f4b65b8e3c8fa43b1dd Mon Sep 17 00:00:00 2001
+From: diamondStar35 <ramymaherali55@gmail.com>
+Date: Mon, 7 Sep 2026 14:03:45 +0300
+Subject: [PATCH] patch/libvpl: fix build with current MinGW headers
+
+---
+ packages/libvpl-0001-fix-mingw-wcscpy-s.patch | 29 +++++++++++++++++++
+ packages/libvpl.cmake                         |  1 +
+ 2 files changed, 30 insertions(+)
+ create mode 100644 packages/libvpl-0001-fix-mingw-wcscpy-s.patch
+
+diff --git a/packages/libvpl-0001-fix-mingw-wcscpy-s.patch b/packages/libvpl-0001-fix-mingw-wcscpy-s.patch
+new file mode 100644
+index 0000000..c03533c
+--- /dev/null
++++ b/packages/libvpl-0001-fix-mingw-wcscpy-s.patch
+@@ -0,0 +1,29 @@
++From 0123456789abcdef0123456789abcdef01234567 Mon Sep 17 00:00:00 2001
++From: diamondStar35 <ramymaherali55@gmail.com>
++Date: Mon, 7 Sep 2026 04:30:00 +0300
++Subject: [PATCH] Fix wcscpy_s macro collision with MinGW headers
++
++The fallback is intended only for old MSVC releases. On MinGW,
++_MSC_VER is undefined and evaluates to zero, causing wcscpy_s to be
++defined before windows.h includes stralign.h. New MinGW headers use
++wcscpy_s themselves, so the function-like macro corrupts that header.
++---
++ libvpl/src/windows/mfx_dispatcher_defs.h | 2 +-
++ 1 file changed, 1 insertion(+), 1 deletion(-)
++
++diff --git a/libvpl/src/windows/mfx_dispatcher_defs.h b/libvpl/src/windows/mfx_dispatcher_defs.h
++index 16abc3e..757fb8a 100644
++--- a/libvpl/src/windows/mfx_dispatcher_defs.h
+++++ b/libvpl/src/windows/mfx_dispatcher_defs.h
++@@ -16,7 +16,7 @@
++ #define MAX_PLUGIN_PATH 4096
++ #define MAX_PLUGIN_NAME 4096
++ 
++-#if _MSC_VER < 1400
+++#if defined(_MSC_VER) && _MSC_VER < 1400
++     #define wcscpy_s(to, to_size, from) \
++         (void)(to_size);                \
++         wcscpy(to, from)
++-- 
++2.53.0
++
+diff --git a/packages/libvpl.cmake b/packages/libvpl.cmake
+index d934857..cbe15e9 100644
+--- a/packages/libvpl.cmake
++++ b/packages/libvpl.cmake
+@@ -5,6 +5,7 @@ ExternalProject_Add(libvpl
+     GIT_REMOTE_NAME origin
+     GIT_TAG main
+     UPDATE_COMMAND ""
++    PATCH_COMMAND ${EXEC} git am --3way ${CMAKE_CURRENT_SOURCE_DIR}/libvpl-*.patch
+     CONFIGURE_COMMAND ${EXEC} CONF=1 cmake -H<SOURCE_DIR> -B<BINARY_DIR>
+         -G Ninja
+         -DCMAKE_BUILD_TYPE=Release
+-- 
+2.54.0.windows.1
+
