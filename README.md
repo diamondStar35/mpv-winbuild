@@ -8,9 +8,22 @@ Use Github Action to build mpv for Windows with latest commit.
 
 Based on <https://github.com/shinchiro/mpv-winbuild-cmake>.
 
-## Auto-Builds
+## Manual builds
 
-Checks the mpv repository every hour for updates. If there is an update and it is relevant to the windows build, it will automatically run the compilation and **release it on success**.
+Open **Actions**, select the **MPV** workflow, then select **Run workflow**. Choose one build variant:
+
+- `gpl`: the normal upstream build.
+- `lgpl`: the static LGPL libmpv build.
+- `lgpl-shared`: the LGPL libmpv build with shared FFmpeg libraries.
+- `all`: all three variants.
+
+For a Luna Player x64 build, select `64bit` and `lgpl-shared`. Leave **Publish a release** disabled for the first test build; enable it after that build succeeds.
+
+A new fork has no compiler or build caches. To bootstrap them, manually run the **LLVM** workflow once with the same target and variant; it dispatches the **toolchain** workflow, which then dispatches **MPV**. After that, run **MPV** directly for normal builds.
+
+## Automatic builds
+
+The upstream repository is dispatched by its maintainer's update automation. That dispatcher is not included or enabled in a fork: the workflows in this repository run only when started manually, or when one workflow dispatches the next workflow in the bootstrap chain described above.
 
 This repo only provides 64-bit version. If you need a 32-bit version, you can fork this repo and run `MPV` workflow by yourself.
 
