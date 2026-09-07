@@ -19,7 +19,9 @@ This repo only provides 64-bit version. If you need a 32-bit version, you can fo
 >
 > Some media players based on libmpv use `libmpv-2.dll` or `mpv-2.dll`.You can upgrade their libmpv by overwriting this dll.
 >
-> `mpv-dev-lgpl-xxxx.7z` is libmpv under LGPLv2.1+ license, which disables LGPLv2.1+ incompatible packages and statically links to ffmpeg under LGPLv3.
+> `mpv-dev-lgpl-xxxx.7z` is the static LGPL build: libmpv under LGPLv2.1+ with LGPLv2.1+ incompatible packages disabled and FFmpeg under LGPLv3 linked statically.
+>
+> `mpv-dev-lgpl-shared-xxxx.7z` is the shared LGPL build. It applies the same license restrictions, dynamically links libmpv to the bundled FFmpeg libraries, and includes `ffmpeg.exe` using those same libraries.
 > 
 > I'm not a lawyer and can't guarantee that I've disabled all LGPL-incompatible packages, use at your own risk.
 

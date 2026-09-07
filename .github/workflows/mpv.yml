@@ -22,7 +22,7 @@ on:
         - all-64bit
         - all
       lgpl:
-        description: "Also build lgpl libmpv"
+        description: "Also build static and shared LGPL libmpv"
         required: false
         default: false
         type: boolean
@@ -104,9 +104,9 @@ jobs:
                 break;
             }
             core.setOutput("matrix_bit",JSON.stringify(matrix));
-            matrix.lgpl=[false];
+            matrix.variant=["gpl"];
             if ("${{ inputs.lgpl}}" == "true") {
-              matrix.lgpl.push(true)
+              matrix.variant.push("lgpl", "lgpl-shared")
             }
             core.setOutput("matrix",JSON.stringify(matrix));
 
@@ -303,7 +303,7 @@ jobs:
           update_packager_index: false
           install_ccache: false
           restore_cache: ${{ inputs.needclean != true }}
-          store_cache: ${{ matrix.lgpl != true && inputs.no_save_cache != true }}
+          store_cache: ${{ matrix.variant == 'gpl' && inputs.no_save_cache != true }}
           override_cache_key: ccache-build${{ matrix.bit }}-${{ inputs.compiler }}
           ccache_options: |
             cache_dir=${{ github.workspace }}/.ccache
@@ -389,10 +389,13 @@ jobs:
               git am --3way "$patch" || git am --abort
             done
           fi
-          if [ "${{ matrix.lgpl }}" = "true" ]; then
+          if [ "${{ matrix.variant }}" != "gpl" ]; then
             git am --3way ../compile-lgpl-libmpv.patch
           fi
-          bash ../build.sh -t '${{ matrix.bit }}' -c '${{ inputs.compiler }}' -s "${{ matrix.lgpl == true && 'true' || 'false' }}"
+          if [ "${{ matrix.variant }}" = "lgpl-shared" ]; then
+            git am --3way ../build-shared-ffmpeg.patch
+          fi
+          bash ../build.sh -t '${{ matrix.bit }}' -c '${{ inputs.compiler }}' -s "${{ matrix.variant != 'gpl' && 'true' || 'false' }}"
       - name: Collect logs
         if: ${{ always() }}
         run: |
@@ -401,7 +404,7 @@ jobs:
         uses: actions/upload-artifact@v7
         if: ${{ always() }}
         with:
-          name: ${{ matrix.bit }}${{ matrix.lgpl == true && '-lgpl' || '' }}_logs
+          name: ${{ matrix.bit }}${{ matrix.variant == 'gpl' && '' || format('-{0}', matrix.variant) }}_logs
           path: logs.7z
 
       - name: "Get artifacts' name and path"
@@ -411,7 +414,8 @@ jobs:
           script: |
             const path = require('path');
             const types = ["mpv-debug", "mpv-dev", "mpv"];
-            const lgpl = ${{ matrix.lgpl }} ? "-lgpl" : "";
+            const variant = "${{ matrix.variant }}";
+            const suffix = variant === "gpl" ? "" : `-${variant}`;
             let arch="";
             switch ( "${{ matrix.bit }}" ) {
               case "32":
@@ -428,7 +432,7 @@ jobs:
                 break;
             }
             for (let type of types) {
-              const globber = await glob.create(`mpv-winbuild-cmake/release/${type}${lgpl}-${arch}-*.7z`);
+              const globber = await glob.create(`mpv-winbuild-cmake/release/${type}${suffix}-${arch}-*.7z`);
               const files = await globber.glob();
               if ( files.length > 0 ) {
                 const file = files[0];
@@ -438,11 +442,34 @@ jobs:
             
             let { stdout: ffmpeg_hash } = await exec.getExecOutput("git -C mpv-winbuild-cmake/src_packages/ffmpeg rev-parse --short HEAD");
             ffmpeg_hash = ffmpeg_hash.trim();
-            const ffmpeg_name = `ffmpeg${lgpl}-${arch}-git-${ffmpeg_hash}`;
+            const ffmpeg_name = `ffmpeg${suffix}-${arch}-git-${ffmpeg_hash}`;
             core.exportVariable( 'ffmpeg_name', ffmpeg_name );
             const globber = await glob.create(`./mpv-winbuild-cmake/build${{ matrix.bit }}/**/ffmpeg.exe`);
-            const ffmpeg_path = (await globber.glob())[0]
-            await exec.exec(`7z a -m0=lzma2 -mx=9 -ms=on mpv-winbuild-cmake/release/${ffmpeg_name}.7z ${ffmpeg_path}`)
+            const ffmpeg_paths = await globber.glob();
+            const ffmpeg_path = ffmpeg_paths.find(file => file.includes(`${path.sep}install${path.sep}`)) ?? ffmpeg_paths[0];
+            if (!ffmpeg_path) {
+              throw new Error("ffmpeg.exe was not produced by the build");
+            }
+
+            const ffmpeg_dir = path.dirname(ffmpeg_path);
+            const archive_files = [path.basename(ffmpeg_path)];
+            if (${{ matrix.variant == 'lgpl-shared' }}) {
+              const dll_patterns = [
+                "avcodec-*.dll", "avdevice-*.dll", "avfilter-*.dll", "avformat-*.dll",
+                "avutil-*.dll", "postproc-*.dll", "swresample-*.dll", "swscale-*.dll",
+                "libavcodec-*.dll", "libavdevice-*.dll", "libavfilter-*.dll", "libavformat-*.dll",
+                "libavutil-*.dll", "libpostproc-*.dll", "libswresample-*.dll", "libswscale-*.dll"
+              ];
+              const dll_globber = await glob.create(dll_patterns.map(pattern => path.join(ffmpeg_dir, pattern)).join("\n"));
+              const dll_paths = await dll_globber.glob();
+              if (dll_paths.length === 0) {
+                throw new Error(`No shared FFmpeg libraries were found beside ${ffmpeg_path}`);
+              }
+              archive_files.push(...dll_paths.map(file => path.basename(file)));
+            }
+
+            const archive_path = path.resolve(`mpv-winbuild-cmake/release/${ffmpeg_name}.7z`);
+            await exec.exec("7z", ["a", "-m0=lzma2", "-mx=9", "-ms=on", archive_path, ...archive_files], { cwd: ffmpeg_dir });
 
       - name: upload mpv-debug
         uses: actions/upload-artifact@v7
@@ -471,25 +498,25 @@ jobs:
           archive: false
 
       - name: Save clang sysroot cache
-        if: ${{ inputs.compiler =='clang' && inputs.no_save_cache != true && matrix.lgpl != true }}
+        if: ${{ inputs.compiler =='clang' && inputs.no_save_cache != true && matrix.variant == 'gpl' }}
         uses: actions/cache/save@v6.1.0
         with: 
           path: ${{ github.workspace }}/mpv-winbuild-cmake/clang_root
           key: ${{ matrix.bit }}-clang_root-${{ env.cache_suffix }}
       - name: Save Sources Cache
-        if: ${{ inputs.no_save_cache != true && matrix.lgpl != true }}
+        if: ${{ inputs.no_save_cache != true && matrix.variant == 'gpl' }}
         uses: actions/cache/save@v6.1.0
         with:
           path: ${{ github.workspace }}/mpv-winbuild-cmake/src_packages
           key: source-${{ env.cache_suffix }}
       - name: Save Rust Cache
-        if: ${{ inputs.no_save_cache != true && matrix.lgpl != true }}
+        if: ${{ inputs.no_save_cache != true && matrix.variant == 'gpl' }}
         uses: actions/cache/save@v6.1.0
         with:
           path: ${{ github.workspace }}/mpv-winbuild-cmake/install_rustup
           key: rust-${{ env.cache_suffix }}
       - name: Save Build Cache
-        if: ${{ inputs.no_save_cache != true && matrix.lgpl != true }}
+        if: ${{ inputs.no_save_cache != true && matrix.variant == 'gpl' }}
         uses: actions/cache/save@v6.1.0
         with:
           path: ${{ github.workspace }}/mpv-winbuild-cmake/build${{ matrix.bit }}
