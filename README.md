@@ -17,7 +17,7 @@ Open **Actions**, select the **MPV** workflow, then select **Run workflow**. Cho
 - `lgpl-shared`: the LGPL libmpv build with shared FFmpeg libraries.
 - `all`: all three variants.
 
-For a Luna Player x64 build, select `64bit` and `lgpl-shared`. Leave **Publish a release** disabled for the first test build; enable it after that build succeeds.
+For a Luna Player build, select `64bit-v2` and `lgpl-shared`. Leave **Publish a release** disabled for the first test build; enable it after that build succeeds.
 
 A new fork has no compiler or build caches. To bootstrap them, manually run the **LLVM** workflow once with the same target and variant; it dispatches the **toolchain** workflow, which then dispatches **MPV**. After that, run **MPV** directly for normal builds.
 
@@ -25,7 +25,7 @@ A new fork has no compiler or build caches. To bootstrap them, manually run the 
 
 The upstream repository is dispatched by its maintainer's update automation. That dispatcher is not included or enabled in a fork: the workflows in this repository run only when started manually, or when one workflow dispatches the next workflow in the bootstrap chain described above.
 
-This repo only provides 64-bit version. If you need a 32-bit version, you can fork this repo and run `MPV` workflow by yourself.
+This repo provides 64-bit builds at three levels: `64bit` runs on any x86-64 CPU, `64bit-v2` needs an Intel Nehalem or AMD Bulldozer or newer, and `64bit-v3` needs an Intel Haswell or AMD Excavator or newer. If you need a 32-bit version, you can fork this repo and run `MPV` workflow by yourself.
 
 > [!NOTE]
 > `mpv-dev-xxxx.7z` is libmpv, including the `libmpv-2.dll` file.

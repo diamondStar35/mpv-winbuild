@@ -27,6 +27,7 @@ on:
         options:
         - 32bit
         - 64bit
+        - 64bit-v2
         - 64bit-v3
         - aarch64
         - all-64bit

@@ -15,19 +15,26 @@ main() {
         package "32" 
     elif [ "$target" == "64" ]; then
         package "64"
+    elif [ "$target" == "64-v2" ]; then
+        package "64-v2"
     elif [ "$target" == "64-v3" ]; then
         package "64-v3"
     elif [ "$target" == "aarch64" ]; then
         package "aarch64"
     elif [ "$target" == "all-64" ]; then
         package "64"
+        package "64-v2"
         package "64-v3"
         package "aarch64"
-    else [ "$target" == "all" ];
+    elif [ "$target" == "all" ]; then
         package "32"
         package "64"
+        package "64-v2"
         package "64-v3"
         package "aarch64"
+    else
+        echo "Unknown target: $target"
+        exit 1
     fi
     rm -rf ./release/mpv-packaging-master
 }
@@ -38,6 +45,10 @@ package() {
         local arch="i686"
     elif [ $bit == "64" ]; then
         local arch="x86_64"
+    elif [ $bit == "64-v2" ]; then
+        local arch="x86_64"
+        local gcc_arch="-DGCC_ARCH=x86-64-v2"
+        local x86_64_level="-v2"
     elif [ $bit == "64-v3" ]; then
         local arch="x86_64"
         local gcc_arch="-DGCC_ARCH=x86-64-v3"

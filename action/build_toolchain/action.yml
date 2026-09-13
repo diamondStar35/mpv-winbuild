@@ -46,6 +46,10 @@ runs:
             arch="i686"
         elif [ $bit == "64" ]; then
             arch="x86_64"
+        elif [ $bit == "64-v2" ]; then
+            arch="x86_64"
+            gcc_arch=-DGCC_ARCH=x86-64-v2
+            x86_64_level=-v2
         elif [ $bit == "64-v3" ]; then
             arch="x86_64"
             gcc_arch=-DGCC_ARCH=x86-64-v3

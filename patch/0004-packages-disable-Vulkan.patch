@@ -1,0 +1,144 @@
+From 5ce2cdee2ad920511c0f78f1489079262c485acb Mon Sep 17 00:00:00 2001
+From: diamondStar35 <ramymaherali55@gmail.com>
+Date: Sun, 13 Sep 2026 05:34:05 +0300
+Subject: [PATCH 1/2] packages: disable Vulkan
+
+Nothing in these builds needs Vulkan on Windows. mpv draws through
+Direct3D 11 first and only falls back to Vulkan, but because the Vulkan
+context, the VK_KHR_display fallback and Vulkan hwdec are linked in, both
+libmpv-2.dll and FFmpeg's avfilter hard-import vulkan-1.dll. libmpv also
+calls vkGetPhysicalDeviceProperties2 and
+vkGetPhysicalDeviceQueueFamilyProperties2, which are Vulkan 1.1, so the
+DLL fails to load with ERROR_PROC_NOT_FOUND on any PC whose system loader
+predates 2018, and with ERROR_MOD_NOT_FOUND where there is no loader.
+
+- Drop the Vulkan loader and headers from the package list.
+- mpv, mpv-release: -Dvulkan=disabled. libplacebo must lose Vulkan too,
+  or mpv refuses to configure.
+- libplacebo: -Dvulkan=disabled. shaderc and spirv-cross stay; its
+  Direct3D 11 backend and mpv's still need them.
+- SDL2: SDL_VULKAN=OFF. mpv only uses SDL for gamepads.
+- FFmpeg: --disable-vulkan, and --disable-libplacebo, since
+  vf_libplacebo cannot run without Vulkan. Both are placed away from the
+  lines the LGPL patch edits so the two still merge.
+---
+ packages/CMakeLists.txt    | 2 --
+ packages/ffmpeg.cmake      | 2 ++
+ packages/libplacebo.cmake  | 3 +--
+ packages/libsdl2.cmake     | 3 +--
+ packages/mpv-release.cmake | 3 +--
+ packages/mpv.cmake         | 3 +--
+ 6 files changed, 6 insertions(+), 10 deletions(-)
+
+diff --git a/packages/CMakeLists.txt b/packages/CMakeLists.txt
+index 1ada4b4..534e801 100644
+--- a/packages/CMakeLists.txt
++++ b/packages/CMakeLists.txt
+@@ -72,8 +72,6 @@ list(APPEND ep
+     spirv-tools
+     spirv-cross
+     glslang
+-    vulkan-header
+-    vulkan
+     libsdl2
+     openal-soft
+     libopenmpt
+diff --git a/packages/ffmpeg.cmake b/packages/ffmpeg.cmake
+index b9ab7a3..df38d8b 100644
+--- a/packages/ffmpeg.cmake
++++ b/packages/ffmpeg.cmake
+@@ -112,6 +112,8 @@ ExternalProject_Add(ffmpeg
+         --enable-vaapi
+         --disable-vdpau
+         --disable-videotoolbox
++        --disable-vulkan
++        --disable-libplacebo # vf_libplacebo needs Vulkan; configure honours the last --enable/--disable
+         --disable-decoder=libaom_av1
+         ${ffmpeg_lto}
+         --extra-cflags='-Wno-error=int-conversion'
+diff --git a/packages/libplacebo.cmake b/packages/libplacebo.cmake
+index b5797dc..a4d446f 100644
+--- a/packages/libplacebo.cmake
++++ b/packages/libplacebo.cmake
+@@ -2,7 +2,6 @@ get_property(src_glad TARGET glad PROPERTY _EP_SOURCE_DIR)
+ get_property(src_fast_float TARGET fast_float PROPERTY _EP_SOURCE_DIR)
+ ExternalProject_Add(libplacebo
+     DEPENDS
+-        vulkan
+         shaderc
+         spirv-cross
+         lcms2
+@@ -28,7 +27,7 @@ ExternalProject_Add(libplacebo
+         -Ddebug=true
+         -Db_ndebug=true
+         -Doptimization=3
+-        -Dvulkan-registry='${MINGW_INSTALL_PREFIX}/share/vulkan/registry/vk.xml'
++        -Dvulkan=disabled
+         -Ddemos=false
+     BUILD_COMMAND ${EXEC} ninja -C <BINARY_DIR>
+     INSTALL_COMMAND ${EXEC} ninja -C <BINARY_DIR> install
+diff --git a/packages/libsdl2.cmake b/packages/libsdl2.cmake
+index f84e5dd..e2cd835 100644
+--- a/packages/libsdl2.cmake
++++ b/packages/libsdl2.cmake
+@@ -1,6 +1,5 @@
+ ExternalProject_Add(libsdl2
+     DEPENDS
+-        vulkan
+         libiconv
+     GIT_REPOSITORY https://github.com/libsdl-org/SDL.git
+     SOURCE_DIR ${SOURCE_LOCATION}
+@@ -16,7 +15,7 @@ ExternalProject_Add(libsdl2
+         -DCMAKE_INSTALL_PREFIX=${MINGW_INSTALL_PREFIX}
+         -DCMAKE_FIND_ROOT_PATH=${MINGW_INSTALL_PREFIX}
+         -DBUILD_SHARED_LIBS=OFF
+-        -DSDL_VULKAN=ON
++        -DSDL_VULKAN=OFF
+         -DSDL_TEST=OFF
+         -DSDL_TEST_LIBRARY=OFF
+     BUILD_COMMAND ${EXEC} ninja -C <BINARY_DIR>
+diff --git a/packages/mpv-release.cmake b/packages/mpv-release.cmake
+index f9f869a..673b1fc 100644
+--- a/packages/mpv-release.cmake
++++ b/packages/mpv-release.cmake
+@@ -31,7 +31,6 @@ ExternalProject_Add(mpv-release
+         uchardet
+         openal-soft
+         mujs
+-        vulkan
+         shaderc
+         libplacebo
+         spirv-cross
+@@ -65,7 +64,7 @@ ExternalProject_Add(mpv-release
+         -Dlcms2=enabled
+         -Dopenal=enabled
+         -Dspirv-cross=enabled
+-        -Dvulkan=enabled
++        -Dvulkan=disabled
+         -Dvapoursynth=enabled
+         -Dsubrandr=enabled
+         -Dsixel=enabled
+diff --git a/packages/mpv.cmake b/packages/mpv.cmake
+index a2954d5..fb5338a 100644
+--- a/packages/mpv.cmake
++++ b/packages/mpv.cmake
+@@ -16,7 +16,6 @@ ExternalProject_Add(mpv
+         uchardet
+         openal-soft
+         mujs
+-        vulkan
+         shaderc
+         libplacebo
+         spirv-cross
+@@ -53,7 +52,7 @@ ExternalProject_Add(mpv
+         -Dlcms2=enabled
+         -Dopenal=enabled
+         -Dspirv-cross=enabled
+-        -Dvulkan=enabled
++        -Dvulkan=disabled
+         -Dvapoursynth=enabled
+         -Dsubrandr=enabled
+         -Dsixel=enabled
+-- 
+2.54.0.windows.1
+
