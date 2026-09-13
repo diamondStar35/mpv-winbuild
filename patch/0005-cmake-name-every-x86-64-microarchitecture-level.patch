@@ -1,0 +1,29 @@
+From 741705940e914cde11a9ff1299f41086b0707859 Mon Sep 17 00:00:00 2001
+From: diamondStar35 <ramymaherali55@gmail.com>
+Date: Sun, 13 Sep 2026 05:34:06 +0300
+Subject: [PATCH 2/2] cmake: name every x86-64 microarchitecture level
+
+The package suffix was taken by matching "-v3" alone, so a build with
+GCC_ARCH=x86-64-v2 got no suffix and its packages were named exactly like
+the baseline x86-64 ones. Match any level instead. x86-64 still gets no
+suffix and x86-64-v3 still gets "-v3".
+---
+ CMakeLists.txt | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 4d681d2..8265b59 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -29,7 +29,7 @@ if(TARGET_CPU STREQUAL "x86_64")
+     set(TARGET_CPU_FAMILY "x86_64")
+     set(TARGET_BITS 64)
+     set(GCC_ARCH "x86-64" CACHE STRING "Target architecture for x86_64")
+-    string(REGEX MATCH "-v3" x86_64_LEVEL ${GCC_ARCH})
++    string(REGEX MATCH "-v[0-9]+" x86_64_LEVEL ${GCC_ARCH})
+ elseif(TARGET_CPU STREQUAL "i686")
+     set(TARGET_CPU_FAMILY "x86")
+     set(TARGET_BITS 32)
+-- 
+2.54.0.windows.1
+

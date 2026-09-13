@@ -14,6 +14,7 @@ on:
         options:
         - 32bit
         - 64bit
+        - 64bit-v2
         - 64bit-v3
         - aarch64
         - all-64bit
@@ -74,6 +75,9 @@ jobs:
               case "64bit":
                 matrix.bit = ["64"];
                 break;
+              case "64bit-v2":
+                matrix.bit = ["64-v2"];
+                break;
               case "64bit-v3":
                 matrix.bit = ["64-v3"];
                 break;
@@ -81,13 +85,13 @@ jobs:
                 matrix.bit = ["aarch64"];
                 break;
               case "all-64bit":
-                matrix.bit = ["64","64-v3","aarch64"];
+                matrix.bit = ["64","64-v2","64-v3","aarch64"];
                 break;
               case "all":
-                matrix.bit = ["32","64","64-v3","aarch64"];
+                matrix.bit = ["32","64","64-v2","64-v3","aarch64"];
                 break;
               default:
-                matrix.bit = ["64","64-v3","aarch64"];
+                matrix.bit = ["64","64-v2","64-v3","aarch64"];
                 break;
             }
             core.setOutput("matrix",JSON.stringify(matrix));
@@ -161,7 +165,7 @@ jobs:
         uses: actions/cache/save@v6.1.0
         with:
           path: ${{ github.workspace }}/mpv-winbuild-cmake/build${{ matrix.bit }}
-          key: toolchain-${{ inputs.compiler }}-build${{ matrix.bit }}-${{ needs.params.outputs.cache_suffix }}
+          key: toolchain-${{ inputs.compiler }}-build${{ matrix.bit }}_${{ needs.params.outputs.cache_suffix }}
 
       - name: Save clang_root cache
         if: ${{ inputs.compiler =='clang' && inputs.no_save_cache != true }}
@@ -236,7 +240,8 @@ jobs:
           script: |
             let build_target=new Set();
             const release = ${{ inputs.release }};
-            const targets = {"build64-v3":"64bit-v3","build64":"64bit","build32":"32bit","buildaarch64":"aarch64"}
+            // Each name ends in "_", as it does in the key, so no target can match another's cache.
+            const targets = {"build64_":"64bit","build64-v2_":"64bit-v2","build64-v3_":"64bit-v3","build32_":"32bit","buildaarch64_":"aarch64"}
             const repo="${{github.repository}}".split('/')[1];
             const cache_suffix="${{ needs.params.outputs.cache_suffix }}";
             const cache = await github.rest.actions.getActionsCacheList({
@@ -260,8 +265,9 @@ jobs:
               }
             }
             if(build_target.size>0){
-              if(build_target.has("64bit-v3") && build_target.has("64bit") && build_target.has("aarch64")) {
+              if(build_target.has("64bit-v3") && build_target.has("64bit-v2") && build_target.has("64bit") && build_target.has("aarch64")) {
                 build_target.delete("64bit-v3");
+                build_target.delete("64bit-v2");
                 build_target.delete("64bit");
                 build_target.delete("aarch64");
                 build_target.add("all-64bit");

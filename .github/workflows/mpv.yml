@@ -17,6 +17,7 @@ on:
         options:
         - 32bit
         - 64bit
+        - 64bit-v2
         - 64bit-v3
         - aarch64
         - all-64bit
@@ -92,6 +93,9 @@ jobs:
               case "64bit":
                 matrix.bit = ["64"];
                 break;
+              case "64bit-v2":
+                matrix.bit = ["64-v2"];
+                break;
               case "64bit-v3":
                 matrix.bit = ["64-v3"];
                 break;
@@ -99,13 +103,13 @@ jobs:
                 matrix.bit = ["aarch64"];
                 break;
               case "all-64bit":
-                matrix.bit = ["64","64-v3","aarch64"];
+                matrix.bit = ["64","64-v2","64-v3","aarch64"];
                 break;
               case "all":
-                matrix.bit = ["32","64","64-v3","aarch64"];
+                matrix.bit = ["32","64","64-v2","64-v3","aarch64"];
                 break;
               default:
-                matrix.bit = ["64","64-v3","aarch64"];
+                matrix.bit = ["64","64-v2","64-v3","aarch64"];
                 break;
             }
             core.setOutput("matrix_bit",JSON.stringify(matrix));
@@ -212,23 +216,26 @@ jobs:
           sed -i '/ccache_conf.in/d'  mpv-winbuild-cmake/CMakeLists.txt
           sed -i '/ccache/d' mpv-winbuild-cmake/exec.in
 
+      # Target and variant names end in "_" inside every key. Restore keys match by prefix, and without a
+      # terminator "build64-" is a prefix of "build64-v2-" and "lgpl-" of "lgpl-shared-", so one target or
+      # variant would restore another's build directory. "_" occurs in none of the names.
       - name: Lookup Toolchain Cache
         id: lookup_toolchain
         uses: actions/cache/restore@v6.1.0
         with:
           path: ${{ github.workspace }}/mpv-winbuild-cmake/build${{ matrix.bit }}
-          key: toolchain-${{ inputs.compiler }}-build${{ matrix.bit }}-${{ env.cache_suffix }}
+          key: toolchain-${{ inputs.compiler }}-build${{ matrix.bit }}_${{ env.cache_suffix }}
           restore-keys: |
-            toolchain-${{ inputs.compiler }}-build${{ matrix.bit }}-
+            toolchain-${{ inputs.compiler }}-build${{ matrix.bit }}_
           lookup-only: true
       - name: Lookup Build Cache
         id: lookup_build
         uses: actions/cache/restore@v6.1.0
         with:
           path: ${{ github.workspace }}/mpv-winbuild-cmake/build${{ matrix.bit }}
-          key: ${{ inputs.compiler }}-build${{ matrix.bit }}-${{ matrix.variant }}-${{ env.cache_suffix }}
+          key: ${{ inputs.compiler }}-build${{ matrix.bit }}_${{ matrix.variant }}_${{ env.cache_suffix }}
           restore-keys: |
-            ${{ inputs.compiler }}-build${{ matrix.bit }}-${{ matrix.variant }}-
+            ${{ inputs.compiler }}-build${{ matrix.bit }}_${{ matrix.variant }}_
           lookup-only: true
           
       - name: Generate cache key
@@ -238,13 +245,13 @@ jobs:
           script: |
             let toolchain_restore_key="${{ steps.lookup_toolchain.outputs.cache-matched-key }}";
             let build_restore_key="${{ steps.lookup_build.outputs.cache-matched-key }}";
-            let build_save_key="${{ inputs.compiler }}-build${{ matrix.bit }}-${{ matrix.variant }}-${{ env.cache_suffix }}";
+            let build_save_key="${{ inputs.compiler }}-build${{ matrix.bit }}_${{ matrix.variant }}_${{ env.cache_suffix }}";
             let key_suffix= "${{ env.cache_suffix }}"
             let restore_suffix= ""; // if only want to match primaryKey, set a value which make restore-keys can't hit
             
             // If toolchain cache exist, compare version of toolchain and build
             if (toolchain_restore_key) {
-              const toolchain_version = toolchain_restore_key.split("-build${{ matrix.bit }}-").at(-1);
+              const toolchain_version = toolchain_restore_key.split("-build${{ matrix.bit }}_").at(-1);
               core.exportVariable( `toolchain_version`, toolchain_version );
 
               build_save_key += `(${toolchain_version})`;
@@ -362,6 +369,10 @@ jobs:
               arch="i686"
           elif [ $bit == "64" ]; then
               arch="x86_64"
+          elif [ $bit == "64-v2" ]; then
+              arch="x86_64"
+              gcc_arch=-DGCC_ARCH=x86-64-v2
+              x86_64_level=-v2
           elif [ $bit == "64-v3" ]; then
               arch="x86_64"
               gcc_arch=-DGCC_ARCH=x86-64-v3
@@ -429,6 +440,9 @@ jobs:
                 break;
               case "64":
                 arch = "x86_64";
+                break;
+              case "64-v2":
+                arch = "x86_64-v2";
                 break;
               case "64-v3":
                 arch = "x86_64-v3";
@@ -706,6 +720,7 @@ jobs:
             const tips = {
               "i686": "for 32 bit system",
               "x86_64": "for 64 bit system",
+              "x86_64-v2": "for 64 bit system with cpu not older than Intel Nehalem or AMD Bulldozer",
               "x86_64-v3": "for 64 bit system with cpu not older than Intel Haswell or AMD Excavator",
               "aarch64": "for ARM64(aarch64)"
             }
@@ -789,8 +804,8 @@ jobs:
         uses: ./action/resave_cache
         with:
           path: ${{ github.workspace }}/mpv-winbuild-cmake/build${{ matrix.bit }}
-          key: toolchain-${{ inputs.compiler }}-build${{ matrix.bit }}-
-          restore-keys: toolchain-${{ inputs.compiler }}-build${{ matrix.bit }}-
+          key: toolchain-${{ inputs.compiler }}-build${{ matrix.bit }}_
+          restore-keys: toolchain-${{ inputs.compiler }}-build${{ matrix.bit }}_
 
       - name: Generate cache key
         id: generate_key
@@ -800,7 +815,7 @@ jobs:
             let toolchain_restore_key="${{ steps.toolchain.outputs.cache-matched-key }}";
             
             if (toolchain_restore_key) {
-              const toolchain_version = toolchain_restore_key.split("-build${{ matrix.bit }}-").at(-1);
+              const toolchain_version = toolchain_restore_key.split("-build${{ matrix.bit }}_").at(-1);
               core.exportVariable( `toolchain_version`, toolchain_version );
             }
 
