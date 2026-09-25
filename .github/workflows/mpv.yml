@@ -400,12 +400,16 @@ jobs:
         run: |
           chmod +x build.sh
           cd mpv-winbuild-cmake
+          # The Prepare step edits CMakeLists.txt and exec.in in place (the ccache tweaks) without
+          # committing. git am refuses to apply over a dirty tree, and any patch touching one of those
+          # files - e.g. the x86-64 microarchitecture-level patch, which edits CMakeLists.txt - aborts
+          # with "Your local changes would be overwritten by merge". Fold the edits into a commit first.
+          git commit -am "ci: fold in-place workflow edits" || true
           if [[ "$(ls -A ../patch/*.patch)" ]]; then
             for patch in ../patch/*.patch ; do
               git am --3way "$patch" || git am --abort
             done
           fi
-          git am --3way ../fix-libvpl-mingw.patch
           if [ "${{ matrix.variant }}" != "gpl" ]; then
             git am --3way ../compile-lgpl-libmpv.patch
           fi
