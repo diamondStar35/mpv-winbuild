@@ -12,33 +12,37 @@ vkGetPhysicalDeviceQueueFamilyProperties2, which are Vulkan 1.1, so the
 DLL fails to load with ERROR_PROC_NOT_FOUND on any PC whose system loader
 predates 2018, and with ERROR_MOD_NOT_FOUND where there is no loader.
 
-- Drop the Vulkan loader and headers from the package list.
+- Drop the Vulkan loader from the package list. Keep vulkan-header: it
+  is headers only, adds no vulkan-1.dll import, and libplacebo needs it
+  at build time (see below).
 - mpv, mpv-release: -Dvulkan=disabled. libplacebo must lose Vulkan too,
   or mpv refuses to configure.
 - libplacebo: -Dvulkan=disabled. shaderc and spirv-cross stay; its
-  Direct3D 11 backend and mpv's still need them.
+  Direct3D 11 backend and mpv's still need them. It keeps a build-time
+  dependency on vulkan-header, since src/vulkan/stubs.c is compiled
+  unconditionally and includes <vulkan/vulkan.h>.
 - SDL2: SDL_VULKAN=OFF. mpv only uses SDL for gamepads.
 - FFmpeg: --disable-vulkan, and --disable-libplacebo, since
   vf_libplacebo cannot run without Vulkan. Both are placed away from the
   lines the LGPL patch edits so the two still merge.
 ---
- packages/CMakeLists.txt    | 2 --
+ packages/CMakeLists.txt    | 1 -
  packages/ffmpeg.cmake      | 2 ++
- packages/libplacebo.cmake  | 3 +--
+ packages/libplacebo.cmake  | 4 ++--
  packages/libsdl2.cmake     | 3 +--
  packages/mpv-release.cmake | 3 +--
  packages/mpv.cmake         | 3 +--
- 6 files changed, 6 insertions(+), 10 deletions(-)
+ 6 files changed, 7 insertions(+), 9 deletions(-)
 
 diff --git a/packages/CMakeLists.txt b/packages/CMakeLists.txt
 index 1ada4b4..534e801 100644
 --- a/packages/CMakeLists.txt
 +++ b/packages/CMakeLists.txt
-@@ -72,8 +72,6 @@ list(APPEND ep
+@@ -72,8 +72,7 @@ list(APPEND ep
      spirv-tools
      spirv-cross
      glslang
--    vulkan-header
+     vulkan-header
 -    vulkan
      libsdl2
      openal-soft
@@ -60,11 +64,12 @@ diff --git a/packages/libplacebo.cmake b/packages/libplacebo.cmake
 index b5797dc..a4d446f 100644
 --- a/packages/libplacebo.cmake
 +++ b/packages/libplacebo.cmake
-@@ -2,7 +2,6 @@ get_property(src_glad TARGET glad PROPERTY _EP_SOURCE_DIR)
+@@ -2,7 +2,7 @@ get_property(src_glad TARGET glad PROPERTY _EP_SOURCE_DIR)
  get_property(src_fast_float TARGET fast_float PROPERTY _EP_SOURCE_DIR)
  ExternalProject_Add(libplacebo
      DEPENDS
 -        vulkan
++        vulkan-header
          shaderc
          spirv-cross
          lcms2
