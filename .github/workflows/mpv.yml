@@ -351,13 +351,13 @@ jobs:
             fi
           done
 
-      - name: Install required output-mixer patch
+      - name: Install required audio patches
         shell: bash
         run: |
           set -euo pipefail
           cp mpv-patches/mpv-*.patch mpv-winbuild-cmake/packages/
           cd mpv-winbuild-cmake
-          # The optional PR step may already have enabled source patches. This patch is required
+          # The optional PR step may already have enabled source patches. These patches are required
           # for every variant, even when no upstream pull requests were selected.
           if ! grep -q 'PATCH_COMMAND.*mpv-.*\.patch' packages/mpv.cmake; then
             git apply --check ../patch_pr/0000-mpv-add-patch.patch

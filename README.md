@@ -23,8 +23,8 @@ A new fork has no compiler or build caches. To bootstrap them, manually run the 
 
 ## Output-mixer fading
 
-Every build variant applies `mpv-patches/mpv-0100-sample-clocked-fades.patch` to
-mpv before compilation. Applying the patch is required: a conflict fails the
+Every build variant applies the patches in `mpv-patches/` to mpv before
+compilation. Applying these patches is required: a conflict fails the
 build rather than silently producing a library without fading support.
 
 The patch adds `audio-fade <target> <duration>`. The target is a linear multiplier
@@ -39,10 +39,25 @@ not consume the ramp.
 The read-only `audio-fade` map exposes `gain`, `target`, `active` and `supported`.
 `gain` describes rendered audio, not necessarily audio already heard. `active`
 remains true until the last ramp sample is expected to reach the speakers,
-using the audio driver's output-delay report. Clients should wait for this
-before pausing or seeking. Seeking clears discarded output deadlines but keeps
+using the audio driver's output-delay report. The native transport commands
+below handle this deadline without client-side polling. Seeking clears discarded output deadlines but keeps
 the envelope; reopening the device starts at the most recently requested target.
 The command can also store a target before an output device exists.
+
+`fade-pause <duration>` fades out, waits for audible completion, and pauses.
+`fade-play <duration>` arms the fade before resuming, or reverses a pending
+fade-out from its current gain. `fade-seek <target> <duration> [relative|absolute]`
+uses a short de-click fade-out, seeks, then applies the requested fade-in. A paused
+seek stays paused. Durations use the same full-range seconds as `audio-fade`.
+
+MPV owns these operations on its core thread. The output callback wakes the core
+when rendering finishes, and the existing dispatcher schedules the audible
+completion deadline. No client timer or managed completion callback is needed.
+Repeated seeks replace or accumulate against the native pending destination;
+rapid pause/resume updates the desired state without queuing obsolete actions.
+The state map also exposes `paused` (including pending transport intent) and
+`transport-active`. Ordinary seek/pause changes and file unload cancel the
+transport-owned envelope. Unsupported outputs use ordinary transport without fades.
 
 Fading supports interleaved and planar 8-, 16- and 32-bit integer PCM and
 32-/64-bit floating-point PCM. Bitstream passthrough, DSD and 64-bit integer

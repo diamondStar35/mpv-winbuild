@@ -1,0 +1,597 @@
+From 429fb7b16bb9f5d01df8a402eb73f7e9e04ee931 Mon Sep 17 00:00:00 2001
+From: diamondStar35 <ramymaherali55@gmail.com>
+Date: Fri, 23 Oct 2026 02:09:34 +0300
+Subject: [PATCH] feat: handle faded pause, play and seek in the native core
+
+Add fade-pause, fade-play and fade-seek with core-thread completion scheduling. Coalesce seek destinations, retain pause intent, arm fade-in before output starts, and reverse fades at the current gain. Release holds after failed seeks and cancel pending actions on ordinary transport changes.
+---
+ DOCS/interface-changes/fade-transport.txt |   1 +
+ DOCS/man/input.rst                        |  36 ++++
+ audio/out/ao.c                            |   6 +
+ audio/out/ao.h                            |   2 +
+ player/audio.c                            | 206 ++++++++++++++++++++++
+ player/command.c                          |  56 +++++-
+ player/core.h                             |  22 +++
+ player/loadfile.c                         |   2 +
+ player/playloop.c                         |  29 ++-
+ 9 files changed, 349 insertions(+), 11 deletions(-)
+ create mode 100644 DOCS/interface-changes/fade-transport.txt
+
+diff --git a/DOCS/interface-changes/fade-transport.txt b/DOCS/interface-changes/fade-transport.txt
+new file mode 100644
+index 0000000..e656eb6
+--- /dev/null
++++ b/DOCS/interface-changes/fade-transport.txt
+@@ -0,0 +1 @@
++add fade-pause, fade-play and fade-seek commands and audio-fade/paused and audio-fade/transport-active properties
+diff --git a/DOCS/man/input.rst b/DOCS/man/input.rst
+index 7ec9a78..df9eff5 100644
+--- a/DOCS/man/input.rst
++++ b/DOCS/man/input.rst
+@@ -311,6 +311,36 @@ Playback Control
+     Without an audio output, the command stores its target without a ramp.
+     Bitstream, DSD and 64-bit integer outputs do not support this command.
+ 
++``fade-pause <duration>``
++    Fade out and pause when the last ramp sample reaches the audio output.
++    ``duration`` is a full-range ramp time in seconds, from 0 to 60. Zero pauses
++    immediately. Use ``audio-fade/paused`` for the requested transport state;
++    ``pause`` continues to describe the actual pause option during the fade-out.
++
++``fade-play <duration>``
++    Arm a sample-clocked fade-in before resuming playback, or reverse an active
++    fade-out at its current gain. Uses the same duration convention. Any obsolete
++    pending pause is cancelled. A fully faded pause needs no seek; an external
++    pause that retained audible device samples is refreshed while still paused.
++
++``fade-seek <target> <duration> [relative|absolute]``
++    Silence the outgoing position with a de-click ramp of at most 5 milliseconds,
++    wait for those samples to reach the output, seek exactly, and fade in over
++    ``duration`` full-range seconds. Relative mode is the default. Repeated
++    relative requests accumulate against the pending destination, while absolute
++    requests replace it. Requests do not queue additional fade-outs.
++
++    A paused seek stays paused. A play or pause command during the seek updates
++    the desired state without discarding the seek. Fade-in is armed by mpv's
++    playback-restart lifecycle before the new audio output starts; no client
++    timestamp matching or completion polling is required. Failed seeks release
++    the fade hold instead of leaving the output muted.
++
++    These transport commands run on the core thread. An output wakeup signals
++    rendering completion and the core dispatcher schedules audible completion.
++    Ordinary seek/pause commands and file unload cancel transport-owned fades.
++    Outputs without PCM fading support use ordinary transport without fading.
++
+ ``seek <target> [<flags>]``
+     Change the playback position. By default, seeks by a relative amount of
+     seconds.
+@@ -2452,6 +2482,12 @@ Property list
+     ``supported``
+         True when the current audio output supports fading. False for no output,
+         bitstream/DSD output and unsupported PCM formats.
++    ``paused``
++        Requested pause state, including a pending faded pause or seek. This
++        allows clients to toggle transport immediately during a fade-out.
++    ``transport-active``
++        True while a native faded pause, seek, or resume refresh is pending.
++        This does not include an ordinary volume ramp or the final fade-in.
+ 
+     A seek discards the queued-completion timestamp but preserves the current
+     envelope. Device recreation starts at the last requested target. Property
+diff --git a/audio/out/ao.c b/audio/out/ao.c
+index 61c5e28..4bbf807 100644
+--- a/audio/out/ao.c
++++ b/audio/out/ao.c
+@@ -669,6 +669,8 @@ struct ao_fade_state ao_get_fade(struct ao *ao)
+         .gain = ao->fade_gain,
+         .target = ao->fade_target,
+         .active = ao->fade_remaining > 0 || ao->fade_end_ns > now,
++        .rendering = ao->fade_remaining > 0,
++        .end_time_ns = ao->fade_end_ns,
+     };
+     mp_mutex_unlock(&ao->fade_lock);
+     return state;
+@@ -742,6 +744,7 @@ void ao_post_process_data(struct ao *ao, void **data, int num_samples,
+     if (!num_samples || !ao_can_fade(ao))
+         return;
+     double volume = atomic_load_explicit(&ao->gain, memory_order_relaxed);
++    bool completed = false;
+     mp_mutex_lock(&ao->fade_lock);
+     bool planar = af_fmt_is_planar(ao->format);
+     int planes = planar ? ao->channels.num : 1;
+@@ -762,9 +765,12 @@ void ao_post_process_data(struct ao *ao, void **data, int num_samples,
+             // sample may still be queued in the hardware output buffer.
+             ao->fade_end_ns = out_time_ns -
+                 (int64_t)((num_samples - count) * 1e9 / ao->samplerate);
++            completed = true;
+         }
+     }
+     mp_mutex_unlock(&ao->fade_lock);
++    if (completed)
++        ao->wakeup_cb(ao->wakeup_ctx);
+ }
+ 
+ static int get_conv_type(struct ao_convert_fmt *fmt)
+diff --git a/audio/out/ao.h b/audio/out/ao.h
+index e02ae21..6015083 100644
+--- a/audio/out/ao.h
++++ b/audio/out/ao.h
+@@ -99,6 +99,8 @@ void ao_set_gain(struct ao *ao, float gain);
+ struct ao_fade_state {
+     double gain, target;
+     bool active;
++    bool rendering;
++    int64_t end_time_ns;
+ };
+ bool ao_set_fade(struct ao *ao, double target, double seconds);
+ bool ao_can_fade(struct ao *ao);
+diff --git a/player/audio.c b/player/audio.c
+index f2cb854..073bf11 100644
+--- a/player/audio.c
++++ b/player/audio.c
+@@ -193,6 +193,212 @@ void audio_update_volume(struct MPContext *mpctx)
+     ao_set_gain(ao_c->ao, gain);
+ }
+ 
++// Fade transport is confined to the core thread. The AO only advances its PCM
++// envelope and wakes the core at rendering completion; it never runs commands.
++bool audio_fade_set(struct MPContext *mpctx, double target, double seconds)
++{
++    if (!isfinite(target) || !isfinite(seconds) || target < 0 || target > 1 ||
++        seconds < 0 || seconds > 60)
++        return false;
++    bool applied = !mpctx->ao || ao_set_fade(mpctx->ao, target, seconds);
++    // Retain transport intent if an unsupported output is later replaced by a
++    // PCM device. Never carry a muted target into a subsequent resume.
++    mpctx->audio_fade_set = true;
++    mpctx->audio_fade_target = target;
++    mp_notify_property(mpctx, "audio-fade");
++    return applied;
++}
++
++void audio_fade_cancel(struct MPContext *mpctx, bool restore)
++{
++    bool owned = mpctx->audio_fade_transport_owned;
++    mpctx->audio_fade_action = AUDIO_FADE_NONE;
++    mpctx->audio_fade_transport_owned = false;
++    if (restore && owned)
++        audio_fade_set(mpctx, 1, 0);
++    mp_notify_property(mpctx, "audio-fade");
++}
++
++bool audio_fade_paused(struct MPContext *mpctx)
++{
++    switch (mpctx->audio_fade_action) {
++    case AUDIO_FADE_PAUSE:
++        return true;
++    case AUDIO_FADE_SEEK_OUT:
++    case AUDIO_FADE_SEEK_WAIT:
++        return mpctx->audio_fade_seek_paused;
++    case AUDIO_FADE_PLAY_WAIT:
++        return false;
++    default:
++        return mpctx->opts->pause;
++    }
++}
++
++static bool fade_can_render(struct MPContext *mpctx)
++{
++    return mpctx->ao && ao_can_fade(mpctx->ao) &&
++           mpctx->audio_status != STATUS_EOF;
++}
++
++static bool fade_waiting_for_seek(struct MPContext *mpctx)
++{
++    return mpctx->audio_fade_action == AUDIO_FADE_SEEK_OUT ||
++           mpctx->audio_fade_action == AUDIO_FADE_SEEK_WAIT ||
++           mpctx->audio_fade_action == AUDIO_FADE_PLAY_WAIT;
++}
++
++void audio_fade_pause(struct MPContext *mpctx, double seconds)
++{
++    if (fade_waiting_for_seek(mpctx)) {
++        mpctx->audio_fade_seek_paused = true;
++        if (mpctx->audio_fade_action != AUDIO_FADE_SEEK_OUT)
++            set_pause_state(mpctx, true);
++        // A refresh seek requested by fade-play can finish while remaining paused.
++        if (mpctx->audio_fade_action == AUDIO_FADE_PLAY_WAIT)
++            mpctx->audio_fade_action = AUDIO_FADE_SEEK_WAIT;
++    } else if (!mpctx->opts->pause) {
++        audio_fade_cancel(mpctx, false);
++        mpctx->audio_fade_transport_owned = true;
++        if (seconds > 0 && fade_can_render(mpctx)) {
++            mpctx->audio_fade_action = AUDIO_FADE_PAUSE;
++            audio_fade_set(mpctx, 0, seconds);
++        } else {
++            set_pause_state(mpctx, true);
++        }
++    }
++    mp_notify_property(mpctx, "audio-fade");
++    mp_wakeup_core(mpctx);
++}
++
++void audio_fade_play(struct MPContext *mpctx, double seconds)
++{
++    if (fade_waiting_for_seek(mpctx)) {
++        mpctx->audio_fade_seek_paused = false;
++        mp_notify_property(mpctx, "audio-fade");
++        mp_wakeup_core(mpctx);
++        return;
++    }
++
++    audio_fade_cancel(mpctx, false);
++    mpctx->audio_fade_transport_owned = true;
++    mpctx->audio_fade_seconds = seconds;
++    if (mpctx->opts->pause && seconds > 0 && fade_can_render(mpctx)) {
++        struct ao_fade_state state = ao_get_fade(mpctx->ao);
++        if (state.gain > 0 || state.active) {
++            // An external pause can retain already mixed, audible samples. Flush
++            // those while paused, without seeking on ordinary faded resumes.
++            double position = get_current_time(mpctx);
++            audio_fade_set(mpctx, 0, 0);
++            mpctx->audio_fade_action = AUDIO_FADE_PLAY_WAIT;
++            mpctx->audio_fade_seek_paused = false;
++            if (mpctx->demuxer && mpctx->demuxer->seekable &&
++                position != MP_NOPTS_VALUE) {
++                mpctx->audio_fade_seek_target = position;
++                queue_seek(mpctx, MPSEEK_ABSOLUTE, position, MPSEEK_EXACT, 0);
++            } else {
++                clear_audio_output_buffers(mpctx);
++                reset_audio_state(mpctx);
++                mpctx->restart_complete = false;
++            }
++            return;
++        }
++    }
++    // Arm before unpausing. A reversal starts at the current render-side gain,
++    // and a fully faded pause already has silent samples in the device queue.
++    audio_fade_set(mpctx, 1, seconds);
++    set_pause_state(mpctx, false);
++}
++
++bool audio_fade_seek(struct MPContext *mpctx, double target, double seconds,
++                     bool absolute)
++{
++    if (!mpctx->playback_initialized || !mpctx->demuxer || !isfinite(target) ||
++        !isfinite(seconds) || seconds < 0 || seconds > 60)
++        return false;
++    bool waiting = fade_waiting_for_seek(mpctx);
++    double position = waiting ? mpctx->audio_fade_seek_target : get_current_time(mpctx);
++    if (!absolute && position == MP_NOPTS_VALUE)
++        return false;
++    target = MPMAX(0, absolute ? target : position + target);
++    double length = get_time_length(mpctx);
++    if (length >= 0)
++        target = MPMIN(target, length);
++    bool paused = audio_fade_paused(mpctx);
++    mpctx->audio_fade_seek_target = target;
++    mpctx->audio_fade_seconds = seconds;
++    mpctx->audio_fade_seek_paused = paused;
++
++    if (mpctx->audio_fade_action == AUDIO_FADE_SEEK_OUT)
++        return true; // replace the destination without restarting the fade-out
++    if (waiting) {
++        mpctx->audio_fade_action = AUDIO_FADE_SEEK_WAIT;
++        queue_seek(mpctx, MPSEEK_ABSOLUTE, target, MPSEEK_EXACT, 0);
++        return true;
++    }
++    audio_fade_cancel(mpctx, false);
++    mpctx->audio_fade_transport_owned = true;
++    if (!paused && seconds > 0 && fade_can_render(mpctx)) {
++        mpctx->audio_fade_action = AUDIO_FADE_SEEK_OUT;
++        audio_fade_set(mpctx, 0, MPMIN(0.005, seconds));
++        mp_wakeup_core(mpctx);
++    } else {
++        // A paused seek must not resume playback. Unsupported outputs retain
++        // ordinary transport behavior, without modifying encoded audio packets.
++        if (fade_can_render(mpctx))
++            audio_fade_set(mpctx, paused ? 0 : 1, 0);
++        mpctx->audio_fade_action = AUDIO_FADE_SEEK_WAIT;
++        queue_seek(mpctx, MPSEEK_ABSOLUTE, target, MPSEEK_EXACT, 0);
++    }
++    mp_notify_property(mpctx, "audio-fade");
++    return true;
++}
++
++void audio_fade_update(struct MPContext *mpctx)
++{
++    enum audio_fade_action action = mpctx->audio_fade_action;
++    if (action != AUDIO_FADE_PAUSE && action != AUDIO_FADE_SEEK_OUT)
++        return;
++    if (mpctx->stop_play || !mpctx->playback_initialized) {
++        audio_fade_cancel(mpctx, true);
++        return;
++    }
++    if (fade_can_render(mpctx)) {
++        struct ao_fade_state state = ao_get_fade(mpctx->ao);
++        if (state.active) {
++            // The AO wakes us when rendering finishes. Only then schedule the
++            // single audible-completion deadline on the existing core dispatcher.
++            if (!state.rendering && !get_internal_paused(mpctx))
++                mp_set_timeout(mpctx, MPMAX(0,
++                    MP_TIME_NS_TO_S(state.end_time_ns - mp_time_ns())));
++            return;
++        }
++    }
++    audio_fade_set(mpctx, 0, 0);
++    if (action == AUDIO_FADE_PAUSE) {
++        mpctx->audio_fade_action = AUDIO_FADE_NONE;
++        set_pause_state(mpctx, true);
++    } else {
++        mpctx->audio_fade_action = AUDIO_FADE_SEEK_WAIT;
++        if (mpctx->audio_fade_seek_paused)
++            set_pause_state(mpctx, true);
++        queue_seek(mpctx, MPSEEK_ABSOLUTE, mpctx->audio_fade_seek_target,
++                   MPSEEK_EXACT, 0);
++    }
++    mp_notify_property(mpctx, "audio-fade");
++}
++
++void audio_fade_restart(struct MPContext *mpctx)
++{
++    if ((mpctx->audio_fade_action != AUDIO_FADE_SEEK_WAIT &&
++         mpctx->audio_fade_action != AUDIO_FADE_PLAY_WAIT) || mpctx->seek.type)
++        return;
++    bool paused = mpctx->audio_fade_seek_paused;
++    mpctx->audio_fade_action = AUDIO_FADE_NONE;
++    audio_fade_set(mpctx, paused ? 0 : 1, paused ? 0 : mpctx->audio_fade_seconds);
++    set_pause_state(mpctx, paused);
++    mp_notify_property(mpctx, "audio-fade");
++}
++
+ // Call this if opts->playback_speed or mpctx->speed_factor_* change.
+ void update_playback_speed(struct MPContext *mpctx)
+ {
+diff --git a/player/command.c b/player/command.c
+index 02ab212..2bed4ab 100644
+--- a/player/command.c
++++ b/player/command.c
+@@ -900,6 +900,8 @@ static int mp_property_audio_fade(void *ctx, struct m_property *prop,
+         {"target", SUB_PROP_DOUBLE(state.target)},
+         {"active", SUB_PROP_BOOL(state.active)},
+         {"supported", SUB_PROP_BOOL(supported)},
++        {"paused", SUB_PROP_BOOL(audio_fade_paused(mpctx))},
++        {"transport-active", SUB_PROP_BOOL(mpctx->audio_fade_action != AUDIO_FADE_NONE)},
+         {0}
+     };
+     return m_property_read_sub(props, action, arg);
+@@ -6034,14 +6036,37 @@ static void cmd_audio_fade(void *p)
+     MPContext *mpctx = cmd->mpctx;
+     double target = cmd->args[0].v.d;
+     double seconds = cmd->args[1].v.d;
+-    if (!isfinite(target) || !isfinite(seconds) ||
+-        (mpctx->ao && !ao_set_fade(mpctx->ao, target, seconds))) {
++    if (!isfinite(target) || !isfinite(seconds)) {
+         cmd->success = false;
+         return;
+     }
+-    mpctx->audio_fade_set = true;
+-    mpctx->audio_fade_target = target;
+-    mp_notify_property(mpctx, "audio-fade");
++    audio_fade_cancel(mpctx, false);
++    cmd->success = audio_fade_set(mpctx, target, seconds);
++}
++
++static void cmd_fade_pause(void *p)
++{
++    struct mp_cmd_ctx *cmd = p;
++    double seconds = cmd->args[0].v.d;
++    cmd->success = isfinite(seconds);
++    if (cmd->success)
++        audio_fade_pause(cmd->mpctx, seconds);
++}
++
++static void cmd_fade_play(void *p)
++{
++    struct mp_cmd_ctx *cmd = p;
++    double seconds = cmd->args[0].v.d;
++    cmd->success = isfinite(seconds);
++    if (cmd->success)
++        audio_fade_play(cmd->mpctx, seconds);
++}
++
++static void cmd_fade_seek(void *p)
++{
++    struct mp_cmd_ctx *cmd = p;
++    cmd->success = audio_fade_seek(cmd->mpctx, cmd->args[0].v.d,
++                                   cmd->args[1].v.d, cmd->args[2].v.i);
+ }
+ 
+ static void cmd_seek(void *p)
+@@ -6049,6 +6074,8 @@ static void cmd_seek(void *p)
+     struct mp_cmd_ctx *cmd = p;
+     struct MPContext *mpctx = cmd->mpctx;
+ 
++    audio_fade_cancel(mpctx, true);
++
+     double v = cmd->args[0].v.d * cmd->cmd->scale;
+     int abs = cmd->args[1].v.i & 3;
+     enum seek_precision precision = MPSEEK_DEFAULT;
+@@ -7634,6 +7661,21 @@ const struct mp_cmd_def mp_cmds[] = {
+             {"duration", OPT_DOUBLE(v.d), M_RANGE(0, 60)},
+         },
+     },
++    { "fade-pause", cmd_fade_pause,
++        { {"duration", OPT_DOUBLE(v.d), M_RANGE(0, 60)} },
++    },
++    { "fade-play", cmd_fade_play,
++        { {"duration", OPT_DOUBLE(v.d), M_RANGE(0, 60)} },
++    },
++    { "fade-seek", cmd_fade_seek,
++        {
++            {"target", OPT_DOUBLE(v.d)},
++            {"duration", OPT_DOUBLE(v.d), M_RANGE(0, 60)},
++            {"mode", OPT_CHOICE(v.i, {"relative", 0}, {"absolute", 1}),
++                OPTDEF_INT(0)},
++        },
++        .allow_auto_repeat = true,
++    },
+ 
+     { "seek", cmd_seek,
+         {
+@@ -8650,8 +8692,10 @@ void mp_option_run_callback(struct MPContext *mpctx, struct mp_option_callback *
+     }
+ #endif
+ 
+-    if (opt_ptr == &opts->pause)
++    if (opt_ptr == &opts->pause) {
++        audio_fade_cancel(mpctx, true);
+         set_pause_state(mpctx, opts->pause);
++    }
+ 
+     if (opt_ptr == &opts->audio_delay) {
+         if (mpctx->ao_chain) {
+diff --git a/player/core.h b/player/core.h
+index d0e6216..1a8f08e 100644
+--- a/player/core.h
++++ b/player/core.h
+@@ -233,6 +233,14 @@ enum playback_status {
+ 
+ const char *mp_status_str(enum playback_status st);
+ 
++enum audio_fade_action {
++    AUDIO_FADE_NONE,
++    AUDIO_FADE_PAUSE,
++    AUDIO_FADE_SEEK_OUT,
++    AUDIO_FADE_SEEK_WAIT,
++    AUDIO_FADE_PLAY_WAIT,
++};
++
+ extern const int num_ptracks[STREAM_TYPE_COUNT];
+ 
+ // Maximum of all num_ptracks[] values.
+@@ -335,6 +343,11 @@ typedef struct MPContext {
+     // Persist the requested envelope when the audio device is recreated.
+     bool audio_fade_set;
+     double audio_fade_target;
++    enum audio_fade_action audio_fade_action;
++    bool audio_fade_transport_owned;
++    bool audio_fade_seek_paused;
++    double audio_fade_seconds;
++    double audio_fade_seek_target;
+ 
+     struct vo_chain *vo_chain;
+ 
+@@ -524,6 +537,15 @@ void uninit_audio_chain(struct MPContext *mpctx);
+ void reinit_audio_chain_src(struct MPContext *mpctx, struct track *track);
+ float audio_get_gain(struct MPContext *mpctx);
+ void audio_update_volume(struct MPContext *mpctx);
++void audio_fade_cancel(struct MPContext *mpctx, bool restore);
++bool audio_fade_set(struct MPContext *mpctx, double target, double seconds);
++void audio_fade_pause(struct MPContext *mpctx, double seconds);
++void audio_fade_play(struct MPContext *mpctx, double seconds);
++bool audio_fade_seek(struct MPContext *mpctx, double target, double seconds,
++                     bool absolute);
++bool audio_fade_paused(struct MPContext *mpctx);
++void audio_fade_update(struct MPContext *mpctx);
++void audio_fade_restart(struct MPContext *mpctx);
+ void reload_audio_output(struct MPContext *mpctx);
+ void audio_start_ao(struct MPContext *mpctx);
+ 
+diff --git a/player/loadfile.c b/player/loadfile.c
+index c17ef9b..4e93562 100644
+--- a/player/loadfile.c
++++ b/player/loadfile.c
+@@ -2106,6 +2106,8 @@ static void play_current_file(struct MPContext *mpctx)
+ 
+ terminate_playback:
+ 
++    audio_fade_cancel(mpctx, true);
++
+     if (!mpctx->stop_play)
+         mpctx->stop_play = PT_ERROR;
+ 
+diff --git a/player/playloop.c b/player/playloop.c
+index e35b2e8..5b43dee 100644
+--- a/player/playloop.c
++++ b/player/playloop.c
+@@ -304,12 +304,12 @@ static double calculate_framestep_pts(MPContext *mpctx, double current_time,
+     return current_time + pts;
+ }
+ 
+-static void mp_seek(MPContext *mpctx, struct seek_params seek)
++static bool mp_seek(MPContext *mpctx, struct seek_params seek)
+ {
+     struct MPOpts *opts = mpctx->opts;
+ 
+     if (!mpctx->demuxer || !seek.type || seek.amount == MP_NOPTS_VALUE)
+-        return;
++        return false;
+ 
+     if (seek.type == MPSEEK_CHAPTER) {
+         mpctx->last_chapter_flag = false;
+@@ -319,7 +319,7 @@ static void mp_seek(MPContext *mpctx, struct seek_params seek)
+     bool hr_seek_very_exact = seek.exact == MPSEEK_VERY_EXACT;
+     double current_time = get_playback_time(mpctx);
+     if (current_time == MP_NOPTS_VALUE && seek.type == MPSEEK_RELATIVE)
+-        return;
++        return false;
+     if (current_time == MP_NOPTS_VALUE)
+         current_time = 0;
+     double seek_pts = MP_NOPTS_VALUE;
+@@ -397,7 +397,7 @@ static void mp_seek(MPContext *mpctx, struct seek_params seek)
+             MP_ERR(mpctx, "Cannot seek in this stream.\n");
+             MP_ERR(mpctx, "You can force it with '--force-seekable=yes'.\n");
+         }
+-        return;
++        return false;
+     }
+ 
+     mpctx->play_dir = play_dir;
+@@ -465,6 +465,7 @@ static void mp_seek(MPContext *mpctx, struct seek_params seek)
+ 
+     mpctx->current_seek = seek;
+     redraw_subs(mpctx);
++    return true;
+ }
+ 
+ // This combines consecutive seek requests.
+@@ -534,8 +535,22 @@ void execute_queued_seek(struct MPContext *mpctx)
+                 mpctx->ao_chain && !mpctx->restart_complete)
+                 return;
+         }
+-        mp_seek(mpctx, mpctx->seek);
++        bool success = mp_seek(mpctx, mpctx->seek);
+         mpctx->seek = (struct seek_params){0};
++        // A rejected seek has no playback-restart event. Release its native
++        // fade hold here so an unseekable stream cannot remain muted forever.
++        if (!success) {
++            if (mpctx->audio_fade_action == AUDIO_FADE_PLAY_WAIT) {
++                // A failed refresh did not discard pre-pause device samples.
++                // Refill the output before resuming instead of exposing those.
++                clear_audio_output_buffers(mpctx);
++                reset_audio_state(mpctx);
++                mpctx->restart_complete = false;
++                mp_wakeup_core(mpctx);
++            } else {
++                audio_fade_restart(mpctx);
++            }
++        }
+     }
+ }
+ 
+@@ -1194,10 +1209,12 @@ static void handle_playback_restart(struct MPContext *mpctx)
+             return;
+         }
+ 
++        audio_fade_restart(mpctx);
+         audio_start_ao(mpctx);
+     }
+ 
+     if (!mpctx->restart_complete) {
++        audio_fade_restart(mpctx);
+         mpctx->hrseek_active = false;
+         mpctx->restart_complete = true;
+         mpctx->current_seek = (struct seek_params){0};
+@@ -1305,6 +1322,8 @@ void run_playloop(struct MPContext *mpctx)
+ 
+     handle_playback_time(mpctx);
+ 
++    audio_fade_update(mpctx);
++
+     handle_dummy_ticks(mpctx);
+ 
+     handle_clipboard_updates(mpctx);
+-- 
+2.54.0.windows.1
+
