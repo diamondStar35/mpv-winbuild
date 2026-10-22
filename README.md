@@ -21,6 +21,33 @@ For a Luna Player build, select `64bit-v2` and `lgpl-shared`. Leave **Publish a 
 
 A new fork has no compiler or build caches. To bootstrap them, manually run the **LLVM** workflow once with the same target and variant; it dispatches the **toolchain** workflow, which then dispatches **MPV**. After that, run **MPV** directly for normal builds.
 
+## Output-mixer fading
+
+Every build variant applies `mpv-patches/mpv-0100-sample-clocked-fades.patch` to
+mpv before compilation. Applying the patch is required: a conflict fails the
+build rather than silently producing a library without fading support.
+
+The patch adds `audio-fade <target> <duration>`. The target is a linear multiplier
+from 0 to 1, separate from the user's volume and mute controls. Duration is the
+full-range ramp time in seconds (0 to 60); partial reversals take proportionally
+less time. A duration of zero sets the envelope for subsequent output samples.
+The ramp advances per PCM sample frame, with the same envelope on every channel,
+after audio filters and immediately before output to the device. It does not
+change filters or send repeated volume commands. Paused or starved output does
+not consume the ramp.
+
+The read-only `audio-fade` map exposes `gain`, `target`, `active` and `supported`.
+`gain` describes rendered audio, not necessarily audio already heard. `active`
+remains true until the last ramp sample is expected to reach the speakers,
+using the audio driver's output-delay report. Clients should wait for this
+before pausing or seeking. Seeking clears discarded output deadlines but keeps
+the envelope; reopening the device starts at the most recently requested target.
+The command can also store a target before an output device exists.
+
+Fading supports interleaved and planar 8-, 16- and 32-bit integer PCM and
+32-/64-bit floating-point PCM. Bitstream passthrough, DSD and 64-bit integer
+output are left untouched and report `supported=false`.
+
 ## Automatic builds
 
 The upstream repository is dispatched by its maintainer's update automation. That dispatcher is not included or enabled in a fork: the workflows in this repository run only when started manually, or when one workflow dispatches the next workflow in the bootstrap chain described above.

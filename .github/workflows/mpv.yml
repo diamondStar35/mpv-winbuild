@@ -351,6 +351,19 @@ jobs:
             fi
           done
 
+      - name: Install required output-mixer patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp mpv-patches/mpv-*.patch mpv-winbuild-cmake/packages/
+          cd mpv-winbuild-cmake
+          # The optional PR step may already have enabled source patches. This patch is required
+          # for every variant, even when no upstream pull requests were selected.
+          if ! grep -q 'PATCH_COMMAND.*mpv-.*\.patch' packages/mpv.cmake; then
+            git apply --check ../patch_pr/0000-mpv-add-patch.patch
+            git apply ../patch_pr/0000-mpv-add-patch.patch
+          fi
+
       - name: Running custom command
         if: ${{ inputs.command != '' }}
         shell: bash

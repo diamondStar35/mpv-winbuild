@@ -1,0 +1,539 @@
+From 4fea05201275b12ea890f9077c52bcf89c45c2fe Mon Sep 17 00:00:00 2001
+From: diamondStar35 <ramymaherali55@gmail.com>
+Date: Fri, 23 Oct 2026 01:34:00 +0300
+Subject: [PATCH] feat: add sample-clocked PCM output fades
+
+Add audio-fade commands and state for an envelope independent of volume and mute. Ramp per sample frame with aligned channel gains and full-precision multiplication. Track audible completion, suspend deadlines during pause, and reset discarded output state.
+---
+ DOCS/interface-changes/audio-fade.txt |   1 +
+ DOCS/man/input.rst                    |  34 ++++++
+ audio/out/ao.c                        | 150 ++++++++++++++++++++++----
+ audio/out/ao.h                        |   8 ++
+ audio/out/buffer.c                    |  24 +++--
+ audio/out/internal.h                  |  12 ++-
+ player/audio.c                        |   2 +
+ player/command.c                      |  45 +++++++-
+ player/core.h                         |   4 +
+ 9 files changed, 249 insertions(+), 31 deletions(-)
+ create mode 100644 DOCS/interface-changes/audio-fade.txt
+
+diff --git a/DOCS/interface-changes/audio-fade.txt b/DOCS/interface-changes/audio-fade.txt
+new file mode 100644
+index 0000000..50c2028
+--- /dev/null
++++ b/DOCS/interface-changes/audio-fade.txt
+@@ -0,0 +1 @@
++add the audio-fade command and read-only audio-fade property for sample-clocked output fades
+diff --git a/DOCS/man/input.rst b/DOCS/man/input.rst
+index 70c3418..7ec9a78 100644
+--- a/DOCS/man/input.rst
++++ b/DOCS/man/input.rst
+@@ -297,6 +297,20 @@ Remember to quote string arguments in input.conf (see `Flat command syntax`_).
+ Playback Control
+ ~~~~~~~~~~~~~~~~
+ 
++``audio-fade <target> <duration>``
++    Fade PCM audio in the output mixer, independently of ``volume`` and ``mute``.
++    ``target`` is a linear amplitude multiplier between 0 and 1. ``duration`` is
++    the full-range ramp time in seconds, from 0 to 60; reversing a partial ramp
++    takes proportionally less time. Zero changes the envelope immediately for
++    samples not yet sent to the device. Samples already queued cannot be changed.
++
++    Ramps advance once per output sample frame, not by wall-clock timers or media
++    timestamps. Pausing or starving the audio output does not consume the ramp.
++    A new command replaces the previous ramp at its current render-side gain.
++    The target persists across device recreation; the initial gain is 1.
++    Without an audio output, the command stores its target without a ramp.
++    Bitstream, DSD and 64-bit integer outputs do not support this command.
++
+ ``seek <target> [<flags>]``
+     Change the playback position. By default, seeks by a relative amount of
+     seconds.
+@@ -2423,6 +2437,26 @@ Property list
+     ``time-remaining/full``
+         ``time-remaining`` with milliseconds.
+ 
++``audio-fade``
++    Output-mixer fade state, as a map with these sub-properties:
++
++    ``gain``
++        Current render-side linear multiplier, between 0 and 1.
++    ``target``
++        Most recently requested multiplier.
++    ``active``
++        True while the envelope is rendering or its last ramp sample is still
++        queued to the audio device. Transport operations such as pause should
++        wait for this to become false, not just for ``gain`` to reach ``target``.
++        The device's reported output delay determines the queued portion.
++    ``supported``
++        True when the current audio output supports fading. False for no output,
++        bitstream/DSD output and unsupported PCM formats.
++
++    A seek discards the queued-completion timestamp but preserves the current
++    envelope. Device recreation starts at the last requested target. Property
++    observers update at the same frequency as ``audio-pts``.
++
+ ``audio-pts``
+     Current audio playback position in current file in seconds. Unlike ``time-pos``,
+     this updates more often than once per frame. This is mostly equivalent to
+diff --git a/audio/out/ao.c b/audio/out/ao.c
+index 4e5e9e3..61c5e28 100644
+--- a/audio/out/ao.c
++++ b/audio/out/ao.c
+@@ -31,6 +31,7 @@
+ #include "options/options.h"
+ #include "options/m_config_frontend.h"
+ #include "osdep/endian.h"
++#include "osdep/timer.h"
+ #include "common/msg.h"
+ #include "common/common.h"
+ #include "common/global.h"
+@@ -161,6 +162,12 @@ const struct m_sub_options ao_conf = {
+     },
+ };
+ 
++static void destroy_ao(void *ptr)
++{
++    struct ao *ao = ptr;
++    mp_mutex_destroy(&ao->fade_lock);
++}
++
+ static struct ao *ao_alloc(bool probing, struct mpv_global *global,
+                            void (*wakeup_cb)(void *ctx), void *wakeup_ctx,
+                            char *name)
+@@ -188,6 +195,9 @@ static struct ao *ao_alloc(bool probing, struct mpv_global *global,
+         .client_name = talloc_strdup(ao, opts->audio_client_name),
+         .set_media_role = opts->audio_set_media_role
+     };
++    mp_mutex_init(&ao->fade_lock);
++    talloc_set_destructor(ao, destroy_ao);
++    ao->fade_gain = ao->fade_target = 1;
+     talloc_free(opts);
+     ao->priv = m_config_group_from_desc(ao, ao->log, global, &desc, name);
+     if (!ao->priv)
+@@ -615,50 +625,146 @@ void ao_set_gain(struct ao *ao, float gain)
+     atomic_store(&ao->gain, gain);
+ }
+ 
+-#define MUL_GAIN_i(d, num_samples, gain, low, center, high)                     \
+-    for (int n = 0; n < (num_samples); n++)                                     \
+-        (d)[n] = MPCLAMP(                                                       \
+-            ((((int64_t)((d)[n]) - (center)) * (gain) + 128) >> 8) + (center),  \
+-            (low), (high))
++bool ao_can_fade(struct ao *ao)
++{
++    switch (af_fmt_from_planar(ao->format)) {
++    case AF_FORMAT_U8:
++    case AF_FORMAT_S16:
++    case AF_FORMAT_S32:
++    case AF_FORMAT_FLOAT:
++    case AF_FORMAT_DOUBLE:
++        return true;
++    default:
++        return false;
++    }
++}
+ 
+-#define MUL_GAIN_f(d, num_samples, gain)                                        \
+-    for (int n = 0; n < (num_samples); n++)                                     \
+-        (d)[n] = (d)[n] * (gain)
++bool ao_set_fade(struct ao *ao, double target, double seconds)
++{
++    if (!ao_can_fade(ao) || !isfinite(target) || !isfinite(seconds) ||
++        target < 0 || target > 1 || seconds < 0 || seconds > 60)
++        return false;
+ 
+-static void process_plane(struct ao *ao, void *data, int num_samples)
++    mp_mutex_lock(&ao->fade_lock);
++    // Duration describes a full-range ramp. Reversals keep the same slope.
++    ao->fade_remaining = llrint(seconds * fabs(target - ao->fade_gain) *
++                               ao->samplerate);
++    bool changes_gain = target != ao->fade_gain || ao->fade_remaining;
++    ao->fade_target = target;
++    if (!ao->fade_remaining)
++        ao->fade_gain = target;
++    // Reissuing an already reached target must still wait for queued ramp
++    // samples. Otherwise cancelling a completed fade can pause the AO early.
++    if (changes_gain)
++        ao->fade_end_ns = 0;
++    mp_mutex_unlock(&ao->fade_lock);
++    return true;
++}
++
++struct ao_fade_state ao_get_fade(struct ao *ao)
++{
++    mp_mutex_lock(&ao->fade_lock);
++    int64_t now = ao->fade_paused_ns ? ao->fade_paused_ns : mp_time_ns();
++    struct ao_fade_state state = {
++        .gain = ao->fade_gain,
++        .target = ao->fade_target,
++        .active = ao->fade_remaining > 0 || ao->fade_end_ns > now,
++    };
++    mp_mutex_unlock(&ao->fade_lock);
++    return state;
++}
++
++void ao_reset_fade_clock(struct ao *ao)
++{
++    mp_mutex_lock(&ao->fade_lock);
++    ao->fade_end_ns = 0;
++    mp_mutex_unlock(&ao->fade_lock);
++}
++
++void ao_pause_fade_clock(struct ao *ao, bool paused)
++{
++    mp_mutex_lock(&ao->fade_lock);
++    int64_t now = mp_time_ns();
++    if (paused && !ao->fade_paused_ns) {
++        ao->fade_paused_ns = now;
++    } else if (!paused && ao->fade_paused_ns) {
++        if (ao->fade_end_ns > ao->fade_paused_ns)
++            ao->fade_end_ns += now - ao->fade_paused_ns;
++        ao->fade_paused_ns = 0;
++    }
++    mp_mutex_unlock(&ao->fade_lock);
++}
++
++// Every plane uses the same envelope snapshot. Interleaved channels share one
++// gain per frame, and integer output is rounded only after multiplying samples.
++#define FADE_SAMPLES(type, expression)                                         \
++    do {                                                                     \
++        type *d = data;                                                      \
++        for (int n = 0; n < frames; n++) {                                    \
++            double fraction = remaining ?                                   \
++                MPMIN((double)n + 1, (double)remaining) / remaining : 1;      \
++            double gain = volume * (start + (target - start) * fraction);     \
++            for (int c = 0; c < channels; c++) {                              \
++                double sample = d[n * channels + c];                         \
++                d[n * channels + c] = (expression);                          \
++            }                                                               \
++        }                                                                   \
++    } while (0)
++
++static void process_plane(struct ao *ao, void *data, int frames, int channels,
++                          double volume, double start, double target,
++                          int64_t remaining)
+ {
+-    float gain = atomic_load_explicit(&ao->gain, memory_order_relaxed);
+-    int gi = lrint(256.0 * gain);
+-    if (gi == 256)
+-        return;
+     switch (af_fmt_from_planar(ao->format)) {
+     case AF_FORMAT_U8:
+-        MUL_GAIN_i((uint8_t *)data, num_samples, gi, 0, 128, 255);
++        FADE_SAMPLES(uint8_t, llrint(MPCLAMP((sample - 128) * gain + 128, 0, 255)));
+         break;
+     case AF_FORMAT_S16:
+-        MUL_GAIN_i((int16_t *)data, num_samples, gi, INT16_MIN, 0, INT16_MAX);
++        FADE_SAMPLES(int16_t, llrint(MPCLAMP(sample * gain, INT16_MIN, INT16_MAX)));
+         break;
+     case AF_FORMAT_S32:
+-        MUL_GAIN_i((int32_t *)data, num_samples, gi, INT32_MIN, 0, INT32_MAX);
++        FADE_SAMPLES(int32_t, llrint(MPCLAMP(sample * gain, INT32_MIN, INT32_MAX)));
+         break;
+     case AF_FORMAT_FLOAT:
+-        MUL_GAIN_f((float *)data, num_samples, gain);
++        FADE_SAMPLES(float, sample * gain);
+         break;
+     case AF_FORMAT_DOUBLE:
+-        MUL_GAIN_f((double *)data, num_samples, gain);
++        FADE_SAMPLES(double, sample * gain);
+         break;
+     default:;
+         // all other sample formats are simply not supported
+     }
+ }
+ 
+-void ao_post_process_data(struct ao *ao, void **data, int num_samples)
++void ao_post_process_data(struct ao *ao, void **data, int num_samples,
++                          int64_t out_time_ns)
+ {
++    if (!num_samples || !ao_can_fade(ao))
++        return;
++    double volume = atomic_load_explicit(&ao->gain, memory_order_relaxed);
++    mp_mutex_lock(&ao->fade_lock);
+     bool planar = af_fmt_is_planar(ao->format);
+     int planes = planar ? ao->channels.num : 1;
+-    int plane_samples = num_samples * (planar ? 1: ao->channels.num);
+-    for (int n = 0; n < planes; n++)
+-        process_plane(ao, data[n], plane_samples);
++    int channels = planar ? 1 : ao->channels.num;
++    if (volume != 1 || ao->fade_gain != 1 || ao->fade_remaining) {
++        for (int n = 0; n < planes; n++)
++            process_plane(ao, data[n], num_samples, channels, volume,
++                          ao->fade_gain, ao->fade_target, ao->fade_remaining);
++    }
++    if (ao->fade_remaining) {
++        int64_t count = MPMIN(ao->fade_remaining, num_samples);
++        ao->fade_gain += (ao->fade_target - ao->fade_gain) *
++                         count / ao->fade_remaining;
++        ao->fade_remaining -= count;
++        if (!ao->fade_remaining) {
++            ao->fade_gain = ao->fade_target;
++            // Rendering completion is not audible completion: the last ramp
++            // sample may still be queued in the hardware output buffer.
++            ao->fade_end_ns = out_time_ns -
++                (int64_t)((num_samples - count) * 1e9 / ao->samplerate);
++        }
++    }
++    mp_mutex_unlock(&ao->fade_lock);
+ }
+ 
+ static int get_conv_type(struct ao_convert_fmt *fmt)
+diff --git a/audio/out/ao.h b/audio/out/ao.h
+index ce044fd..e02ae21 100644
+--- a/audio/out/ao.h
++++ b/audio/out/ao.h
+@@ -95,6 +95,14 @@ const char *ao_get_description(struct ao *ao);
+ bool ao_untimed(struct ao *ao);
+ int ao_control(struct ao *ao, enum aocontrol cmd, void *arg);
+ void ao_set_gain(struct ao *ao, float gain);
++
++struct ao_fade_state {
++    double gain, target;
++    bool active;
++};
++bool ao_set_fade(struct ao *ao, double target, double seconds);
++bool ao_can_fade(struct ao *ao);
++struct ao_fade_state ao_get_fade(struct ao *ao);
+ double ao_get_delay(struct ao *ao);
+ void ao_reset(struct ao *ao);
+ void ao_start(struct ao *ao);
+diff --git a/audio/out/buffer.c b/audio/out/buffer.c
+index 277b524..5f94daf 100644
+--- a/audio/out/buffer.c
++++ b/audio/out/buffer.c
+@@ -117,7 +117,7 @@ struct mp_async_queue *ao_get_queue(struct ao *ao)
+ 
+ // Special behavior with data==NULL: caller uses p->pending.
+ static int read_buffer(struct ao *ao, void **data, int samples, bool *eof,
+-                       bool pad_silence)
++                       bool pad_silence, int64_t start_time_ns)
+ {
+     struct buffer_state *p = ao->buffer_state;
+     int pos = 0;
+@@ -157,8 +157,11 @@ static int read_buffer(struct ao *ao, void **data, int samples, bool *eof,
+         if (!p->pending)
+             return 0;
+         void **pd = (void *)mp_aframe_get_data_rw(p->pending);
+-        if (pd)
+-            ao_post_process_data(ao, pd, mp_aframe_get_size(p->pending));
++        if (pd) {
++            int frames = mp_aframe_get_size(p->pending);
++            ao_post_process_data(ao, pd, frames,
++                start_time_ns + (int64_t)(frames * 1e9 / ao->samplerate));
++        }
+         return 1;
+     }
+ 
+@@ -171,7 +174,8 @@ static int read_buffer(struct ao *ao, void **data, int samples, bool *eof,
+         }
+     }
+ 
+-    ao_post_process_data(ao, data, pos);
++    ao_post_process_data(ao, data, pos,
++        start_time_ns + (int64_t)(pos * 1e9 / ao->samplerate));
+     return pos;
+ }
+ 
+@@ -181,7 +185,9 @@ static int ao_read_data_locked(struct ao *ao, void **data, int samples,
+     struct buffer_state *p = ao->buffer_state;
+     mp_assert(!ao->driver->write);
+ 
+-    int pos = read_buffer(ao, data, samples, eof, pad_silence);
++    int64_t start_time_ns = out_time_ns -
++        (int64_t)(samples * 1e9 / ao->samplerate);
++    int pos = read_buffer(ao, data, samples, eof, pad_silence, start_time_ns);
+ 
+     if (pos > 0)
+         p->end_time_ns = out_time_ns;
+@@ -346,6 +352,7 @@ void ao_reset(struct ao *ao)
+     p->recover_pause = false;
+     p->hw_paused = false;
+     p->end_time_ns = 0;
++    ao_reset_fade_clock(ao);
+ 
+     mp_mutex_unlock(&p->lock);
+ 
+@@ -432,6 +439,7 @@ void ao_set_paused(struct ao *ao, bool paused, bool eof)
+         wakeup = true;
+     }
+     p->paused = paused;
++    ao_pause_fade_clock(ao, paused);
+ 
+     mp_mutex_unlock(&p->lock);
+ 
+@@ -643,9 +651,11 @@ static bool ao_play_data(struct ao *ao)
+ 
+     int samples = 0;
+     bool got_eof = false;
++    int64_t start_time_ns = mp_time_ns() +
++        (int64_t)(MPMAX(0, state.delay) * 1e9);
+     if (ao->driver->write_frames) {
+         TA_FREEP(&p->pending);
+-        samples = read_buffer(ao, NULL, 1, &got_eof, false);
++        samples = read_buffer(ao, NULL, 1, &got_eof, false, start_time_ns);
+         planes = (void **)&p->pending;
+     } else {
+         if (!realloc_buf(ao, space)) {
+@@ -662,7 +672,7 @@ static bool ao_play_data(struct ao *ao)
+         }
+ 
+         if (!samples) {
+-            samples = read_buffer(ao, planes, space, &got_eof, true);
++            samples = read_buffer(ao, planes, space, &got_eof, true, start_time_ns);
+             if (p->paused || (ao->stream_silence && !p->playing))
+                 samples = space; // read_buffer() sets remainder to silent
+         }
+diff --git a/audio/out/internal.h b/audio/out/internal.h
+index 85fa777..50009a8 100644
+--- a/audio/out/internal.h
++++ b/audio/out/internal.h
+@@ -22,6 +22,7 @@
+ #include <stdbool.h>
+ 
+ #include "audio/out/ao.h"
++#include "osdep/threads.h"
+ 
+ /* global data used by ao.c and ao drivers */
+ struct ao {
+@@ -67,6 +68,12 @@ struct ao {
+     // Float gain multiplicator
+     _Atomic float gain;
+ 
++    // Independent of user volume; advanced only by PCM frames sent to the AO.
++    mp_mutex fade_lock;
++    double fade_gain, fade_target;
++    int64_t fade_remaining;
++    int64_t fade_end_ns, fade_paused_ns;
++
+     int buffer;
+     double def_buffer;
+     struct buffer_state *buffer_state;
+@@ -214,7 +221,10 @@ bool ao_chmap_sel_get_def(struct ao *ao, const struct mp_chmap_sel *s,
+ void ao_device_list_add(struct ao_device_list *list, struct ao *ao,
+                         struct ao_device_desc *e);
+ 
+-void ao_post_process_data(struct ao *ao, void **data, int num_samples);
++void ao_post_process_data(struct ao *ao, void **data, int num_samples,
++                          int64_t out_time_ns);
++void ao_reset_fade_clock(struct ao *ao);
++void ao_pause_fade_clock(struct ao *ao, bool paused);
+ 
+ struct ao_convert_fmt {
+     int src_fmt;        // source AF_FORMAT_*
+diff --git a/player/audio.c b/player/audio.c
+index 7dc1915..f2cb854 100644
+--- a/player/audio.c
++++ b/player/audio.c
+@@ -499,6 +499,8 @@ static int reinit_audio_filters_and_output(struct MPContext *mpctx)
+ 
+     ao_chain_set_ao(ao_c, mpctx->ao);
+ 
++    if (mpctx->audio_fade_set)
++        ao_set_fade(mpctx->ao, mpctx->audio_fade_target, 0);
+     audio_update_volume(mpctx);
+ 
+     // Almost nonsensical hack to deal with certain format change scenarios.
+diff --git a/player/command.c b/player/command.c
+index 73d26d8..02ab212 100644
+--- a/player/command.c
++++ b/player/command.c
+@@ -886,6 +886,25 @@ static int mp_property_audio_pts(void *ctx, struct m_property *prop,
+     return property_time(action, arg, playing_audio_pts(mpctx));
+ }
+ 
++static int mp_property_audio_fade(void *ctx, struct m_property *prop,
++                                 int action, void *arg)
++{
++    MPContext *mpctx = ctx;
++    double gain = mpctx->audio_fade_set ? mpctx->audio_fade_target : 1;
++    struct ao_fade_state state = {.gain = gain, .target = gain};
++    bool supported = mpctx->ao && ao_can_fade(mpctx->ao);
++    if (mpctx->ao)
++        state = ao_get_fade(mpctx->ao);
++    struct m_sub_property props[] = {
++        {"gain", SUB_PROP_DOUBLE(state.gain)},
++        {"target", SUB_PROP_DOUBLE(state.target)},
++        {"active", SUB_PROP_BOOL(state.active)},
++        {"supported", SUB_PROP_BOOL(supported)},
++        {0}
++    };
++    return m_property_read_sub(props, action, arg);
++}
++
+ static bool time_remaining(MPContext *mpctx, double *remaining)
+ {
+     double len = get_time_length(mpctx);
+@@ -4708,6 +4727,7 @@ static const struct m_property mp_properties_base[] = {
+     {"time-pos", mp_property_time_pos},
+     {"time-remaining", mp_property_remaining},
+     {"audio-pts", mp_property_audio_pts},
++    {"audio-fade", mp_property_audio_fade},
+     {"playtime-remaining", mp_property_playtime_remaining},
+     M_PROPERTY_ALIAS("playback-time", "time-pos"),
+     {"remaining-file-loops", mp_property_remaining_file_loops},
+@@ -4922,7 +4942,7 @@ static const char *const *const mp_event_property_change[] = {
+     E(MP_EVENT_TRACKS_CHANGED, "track-list", "current-tracks"),
+     E(MP_EVENT_TRACK_SWITCHED, "track-list", "current-tracks"),
+     E(MPV_EVENT_IDLE, "*"),
+-    E(MPV_EVENT_TICK, "time-pos", "audio-pts", "stream-pos", "avsync",
++    E(MPV_EVENT_TICK, "time-pos", "audio-pts", "audio-fade", "stream-pos", "avsync",
+       "percent-pos", "time-remaining", "playtime-remaining", "playback-time",
+       "estimated-vf-fps", "total-avsync-change", "audio-speed-correction",
+       "video-speed-correction", "vo-delayed-frame-count", "mistimed-frame-count",
+@@ -6008,6 +6028,22 @@ void mp_cmd_msg(struct mp_cmd_ctx *cmd, int status, const char *msg, ...)
+     talloc_free(s);
+ }
+ 
++static void cmd_audio_fade(void *p)
++{
++    struct mp_cmd_ctx *cmd = p;
++    MPContext *mpctx = cmd->mpctx;
++    double target = cmd->args[0].v.d;
++    double seconds = cmd->args[1].v.d;
++    if (!isfinite(target) || !isfinite(seconds) ||
++        (mpctx->ao && !ao_set_fade(mpctx->ao, target, seconds))) {
++        cmd->success = false;
++        return;
++    }
++    mpctx->audio_fade_set = true;
++    mpctx->audio_fade_target = target;
++    mp_notify_property(mpctx, "audio-fade");
++}
++
+ static void cmd_seek(void *p)
+ {
+     struct mp_cmd_ctx *cmd = p;
+@@ -7592,6 +7628,13 @@ static void cmd_notify_property(void *p)
+ const struct mp_cmd_def mp_cmds[] = {
+     { "ignore", cmd_ignore, .is_ignore = true, .is_noisy = true, },
+ 
++    { "audio-fade", cmd_audio_fade,
++        {
++            {"target", OPT_DOUBLE(v.d), M_RANGE(0, 1)},
++            {"duration", OPT_DOUBLE(v.d), M_RANGE(0, 60)},
++        },
++    },
++
+     { "seek", cmd_seek,
+         {
+             {"target", OPT_TIME(v.d)},
+diff --git a/player/core.h b/player/core.h
+index 2889d35..d0e6216 100644
+--- a/player/core.h
++++ b/player/core.h
+@@ -332,6 +332,10 @@ typedef struct MPContext {
+     struct mp_aframe *ao_filter_fmt; // for weak gapless audio check
+     struct ao_chain *ao_chain;
+ 
++    // Persist the requested envelope when the audio device is recreated.
++    bool audio_fade_set;
++    double audio_fade_target;
++
+     struct vo_chain *vo_chain;
+ 
+     struct vo *video_out;
+-- 
+2.54.0.windows.1
+
