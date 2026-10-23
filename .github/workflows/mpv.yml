@@ -183,7 +183,6 @@ jobs:
     runs-on: ubuntu-latest
     container:
       image: ghcr.io/archlinux/archlinux:base-devel
-    continue-on-error: true
     strategy:
       matrix: ${{ fromJson(needs.params.outputs.matrix) }}
 
@@ -429,6 +428,7 @@ jobs:
           if [ "${{ matrix.variant }}" = "lgpl-shared" ]; then
             git am --3way ../build-shared-ffmpeg.patch
           fi
+          git am --3way ../update-openssl.patch
           bash ../build.sh -t '${{ matrix.bit }}' -c '${{ inputs.compiler }}' -s "${{ matrix.variant != 'gpl' && 'true' || 'false' }}"
       - name: Collect logs
         if: ${{ always() }}

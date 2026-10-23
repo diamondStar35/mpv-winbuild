@@ -1,0 +1,26 @@
+From 15f7ff76bd272609fe2d9d479a3e677901af19a3 Mon Sep 17 00:00:00 2001
+From: diamondStar35 <ramymaherali55@gmail.com>
+Date: Fri, 23 Oct 2026 10:50:17 +0300
+Subject: [PATCH] Update the OpenSSL revision required by curl
+
+Use the pinned upstream revision containing ASN1_STRING_get_length, which current curl selects for OpenSSL 4.1. The previous pin advertised 4.1 but predates that API, causing the Windows build to fail before mpv compilation.
+---
+ packages/openssl.cmake | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/packages/openssl.cmake b/packages/openssl.cmake
+index 7510e50..ba1208a 100644
+--- a/packages/openssl.cmake
++++ b/packages/openssl.cmake
+@@ -8,7 +8,7 @@ ExternalProject_Add(openssl
+     GIT_CLONE_FLAGS "--sparse --filter=tree:0"
+     GIT_CLONE_POST_COMMAND "sparse-checkout set --no-cone /* !test"
+     GIT_REMOTE_NAME origin
+-    GIT_RESET d8bf6cdd4849925c30e4f1911c7acb49cb34b702
++    GIT_RESET 7501955b0b2fbd6e7348bc8166055993d73af64e
+     GIT_SUBMODULES ""
+     UPDATE_COMMAND ""
+     PATCH_COMMAND ${EXEC} git am --3way ${CMAKE_CURRENT_SOURCE_DIR}/openssl-*.patch
+-- 
+2.54.0.windows.1
+
