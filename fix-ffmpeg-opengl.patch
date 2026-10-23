@@ -1,0 +1,25 @@
+From 485c67a01cca4742bbda604450186847bac7ac8f Mon Sep 17 00:00:00 2001
+From: diamondStar35 <ramymaherali55@gmail.com>
+Date: Fri, 23 Oct 2026 13:42:40 +0300
+Subject: [PATCH] fix: remove the obsolete FFmpeg OpenGL configure option
+
+Remove --enable-opengl from the FFmpeg build recipe because current FFmpeg rejects the removed option before configuration can complete.
+---
+ packages/ffmpeg.cmake | 1 -
+ 1 file changed, 1 deletion(-)
+
+diff --git a/packages/ffmpeg.cmake b/packages/ffmpeg.cmake
+index b9ab7a3..fc0149d 100644
+--- a/packages/ffmpeg.cmake
++++ b/packages/ffmpeg.cmake
+@@ -105,7 +105,6 @@ ExternalProject_Add(ffmpeg
+         --enable-nvenc
+         --enable-amf
+         --enable-openal
+-        --enable-opengl
+         --disable-doc
+         --disable-ffplay
+         --disable-ffprobe
+-- 
+2.54.0.windows.1
+

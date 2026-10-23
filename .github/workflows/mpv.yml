@@ -429,6 +429,7 @@ jobs:
             git am --3way ../build-shared-ffmpeg.patch
           fi
           git am --3way ../update-openssl.patch
+          git am --3way ../fix-ffmpeg-opengl.patch
           bash ../build.sh -t '${{ matrix.bit }}' -c '${{ inputs.compiler }}' -s "${{ matrix.variant != 'gpl' && 'true' || 'false' }}"
       - name: Collect logs
         if: ${{ always() }}
