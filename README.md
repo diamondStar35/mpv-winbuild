@@ -63,7 +63,22 @@ Fading supports interleaved and planar 8-, 16- and 32-bit integer PCM and
 32-/64-bit floating-point PCM. Bitstream passthrough, DSD and 64-bit integer
 output are left untouched and report `supported=false`.
 
-## Future cross-fading clients
+## Cross-fading clients
+
+Set `audio-crossfade-duration` to 0–30 seconds before loading a playlist to
+enable native automatic audio transitions. Zero is the default and disables
+the scheduler. `audio-crossfade-curve` selects `linear` (default) or
+`equal-power`. Automatic mode reserves its own PCM lookahead; it does not
+require a separate `audio-crossfade-buffer` setting.
+
+MPV prefetches the queued successor, waits for the final decoded PCM window,
+then advances and opens the next decoder while outgoing PCM is playing.
+The mixer owns the overlap; clients only provide playlist entries. Playlist
+order and loop/shuffle policy are preserved, and transitions report natural
+EOF. Active A-B loops, explicit end ranges, remaining file loops, reverse
+playback, frame stepping, video and `keep-open=always` use ordinary playback.
+Cover art is supported. Short incoming files shorten the overlap without
+discarding the outgoing file's end. Online streams remain best-effort.
 
 The native `crossfade-loadfile <url> <seconds> [linear|equal-power] [<options>]`
 command replaces the current file with an audio overlap. It retains **unplayed**
@@ -78,7 +93,7 @@ tail are capped at 64 MiB each. The option defaults to zero, so ordinary startup
 and buffering are unchanged. Linear is the default curve; equal-power can need
 extra peak headroom. The command result reports `captured` seconds and the new
 `playlist_entry_id`; `audio-crossfade` exposes `active`, `waiting`, `remaining`,
-`available` and `supported` for clients.
+`available`, `supported`, `automatic` and `capacity` for clients.
 
 Overlap is limited by PCM actually available and incoming decoder readiness.
 If opening the new file is slow, the outgoing audio fades while it opens and
@@ -89,8 +104,9 @@ Video is not cross-faded. Stop, seek and unrelated file navigation discard the
 overlap rather than draining it. The command replaces the playlist like
 `loadfile ... replace`, and does not automatically schedule transitions.
 
-Luna does not enable this yet. Its wrapper exposes `CrossfadeLoadFile` for the
-future feature; no preference or playlist behavior changes in this work.
+Luna does not enable this yet. Its wrapper exposes `SetAutomaticCrossfade` and
+`CrossfadeLoadFile` for the future feature; Luna's preferences and playlist
+behavior are unchanged.
 
 ## Automatic builds
 
