@@ -63,6 +63,35 @@ Fading supports interleaved and planar 8-, 16- and 32-bit integer PCM and
 32-/64-bit floating-point PCM. Bitstream passthrough, DSD and 64-bit integer
 output are left untouched and report `supported=false`.
 
+## Future cross-fading clients
+
+The native `crossfade-loadfile <url> <seconds> [linear|equal-power] [<options>]`
+command replaces the current file with an audio overlap. It retains **unplayed**
+filtered PCM from the outgoing file and mixes that reserve with the incoming
+decoder's PCM on the same output device. It does not replay an already heard
+tail. The outgoing file's ReplayGain is retained; live user volume, mute and
+pause/resume fading affect both sources together.
+
+Configure `audio-crossfade-buffer` before loading the outgoing file to reserve
+up to 30 seconds of decoded lookahead. Both the optional lookahead and retained
+tail are capped at 64 MiB each. The option defaults to zero, so ordinary startup
+and buffering are unchanged. Linear is the default curve; equal-power can need
+extra peak headroom. The command result reports `captured` seconds and the new
+`playlist_entry_id`; `audio-crossfade` exposes `active`, `waiting`, `remaining`,
+`available` and `supported` for clients.
+
+Overlap is limited by PCM actually available and incoming decoder readiness.
+If opening the new file is slow, the outgoing audio fades while it opens and
+the overlap is shorter; if the reserve runs out, ordinary loading resumes.
+Unsupported outputs fall back to normal replacement. Incoming PCM is converted
+to the retained output format; incompatible devices are reopened normally.
+Video is not cross-faded. Stop, seek and unrelated file navigation discard the
+overlap rather than draining it. The command replaces the playlist like
+`loadfile ... replace`, and does not automatically schedule transitions.
+
+Luna does not enable this yet. Its wrapper exposes `CrossfadeLoadFile` for the
+future feature; no preference or playlist behavior changes in this work.
+
 ## Automatic builds
 
 The upstream repository is dispatched by its maintainer's update automation. That dispatcher is not included or enabled in a fork: the workflows in this repository run only when started manually, or when one workflow dispatches the next workflow in the bootstrap chain described above.

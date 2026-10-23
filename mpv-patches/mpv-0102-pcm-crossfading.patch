@@ -1,0 +1,953 @@
+From 4074cfe69df535f4ec669009891cdcf72bb800b9 Mon Sep 17 00:00:00 2001
+From: diamondStar35 <ramymaherali55@gmail.com>
+Date: Fri, 23 Oct 2026 10:55:18 +0300
+Subject: [PATCH] feat: mix outgoing and incoming PCM during file cross-fades
+
+Add crossfade-loadfile and the audio-crossfade state map. Retain unplayed outgoing PCM and mix it with incoming audio using linear or equal-power curves. Bound lookahead and retained PCM to 64 MiB each, preserve per-track ReplayGain, and apply volume, mute and transport fades to both sources. Handle short incoming files, interruptions and output-format fallback.
+---
+ DOCS/interface-changes/crossfade.txt |   1 +
+ DOCS/man/input.rst                   |  45 ++++++
+ DOCS/man/options.rst                 |  12 ++
+ audio/out/ao.c                       |  75 +++++++---
+ audio/out/ao.h                       |  12 ++
+ audio/out/buffer.c                   | 199 +++++++++++++++++++++++++--
+ audio/out/internal.h                 |  15 +-
+ player/audio.c                       |  55 +++++++-
+ player/command.c                     |  66 ++++++++-
+ player/core.h                        |   2 +
+ player/loadfile.c                    |  19 ++-
+ player/playloop.c                    |   6 +-
+ 12 files changed, 472 insertions(+), 35 deletions(-)
+ create mode 100644 DOCS/interface-changes/crossfade.txt
+
+diff --git a/DOCS/interface-changes/crossfade.txt b/DOCS/interface-changes/crossfade.txt
+new file mode 100644
+index 0000000..ce736d9
+--- /dev/null
++++ b/DOCS/interface-changes/crossfade.txt
+@@ -0,0 +1 @@
++add crossfade-loadfile, audio-crossfade state, and the disabled-by-default audio-crossfade-buffer option
+diff --git a/DOCS/man/input.rst b/DOCS/man/input.rst
+index df9eff5..c428f34 100644
+--- a/DOCS/man/input.rst
++++ b/DOCS/man/input.rst
+@@ -341,6 +341,35 @@ Playback Control
+     Ordinary seek/pause commands and file unload cancel transport-owned fades.
+     Outputs without PCM fading support use ordinary transport without fading.
+ 
++``crossfade-loadfile <url> <duration> [linear|equal-power] [<options>]``
++    Replace playback with an opt-in PCM cross-fade to another file. ``duration``
++    is from 0 to 30 seconds. The command retains upcoming, unplayed PCM from the
++    outgoing file and mixes it with the incoming decoder's output on the same
++    audio device. It never replays audio that has already been heard.
++
++    Configure ``--audio-crossfade-buffer`` before playback to reserve enough
++    outgoing PCM. Without sufficient buffering, the overlap is shorter than
++    requested. The result map includes ``playlist_entry_id`` and ``captured``
++    (retained seconds). ``audio-crossfade`` reports live output state. Memory is
++    bounded to 64 MiB each for the optional lookahead and the outgoing reserve.
++
++    Linear is the default curve; equal-power is also available and may require
++    extra peak headroom. Per-file ReplayGain is retained separately for each
++    source. User volume, mute, and the ordinary fade envelope affect both sources
++    together. Pausing freezes the overlap; seeking or stopping discards it.
++    Incoming PCM is converted to the retained device's rate, format and channels.
++    A known short incoming duration limits the overlap to avoid an outgoing tail
++    continuing after the incoming file has ended.
++
++    The outgoing audio fades while the incoming file opens. If the incoming
++    decoder is late, the overlap is shortened; if it is not ready before the
++    reserve ends, playback falls back to ordinary loading. This is best-effort
++    for online streams, not a network latency guarantee. Bitstream, DSD, encoded
++    output and frame-oriented devices use ordinary replacement without overlap.
++    Video switches normally; video frames are not blended. This command replaces
++    the playlist, like ``loadfile ... replace``, and accepts the same per-file
++    option pairs. It does not schedule automatic cross-fading between entries.
++
+ ``seek <target> [<flags>]``
+     Change the playback position. By default, seeks by a relative amount of
+     seconds.
+@@ -2493,6 +2522,22 @@ Property list
+     envelope. Device recreation starts at the last requested target. Property
+     observers update at the same frequency as ``audio-pts``.
+ 
++``audio-crossfade``
++    Native cross-fade state, as a map with these sub-properties:
++
++    ``active``
++        True while outgoing PCM remains or its final mixed sample is queued.
++    ``waiting``
++        True while the incoming file has not attached its audio output chain.
++    ``remaining``
++        Estimated seconds of retained output remaining, including its final
++        queued completion deadline. Pausing freezes the output clock.
++    ``available``
++        Seconds of currently buffered PCM eligible for a future overlap. This
++        excludes samples already sent to the audio hardware.
++    ``supported``
++        True when the current output supports this PCM mixer.
++
+ ``audio-pts``
+     Current audio playback position in current file in seconds. Unlike ``time-pos``,
+     this updates more often than once per frame. This is mostly equivalent to
+diff --git a/DOCS/man/options.rst b/DOCS/man/options.rst
+index 86892bf..51df74e 100644
+--- a/DOCS/man/options.rst
++++ b/DOCS/man/options.rst
+@@ -2474,6 +2474,18 @@ Audio
+ 
+     Default: 0.2 (200 ms).
+ 
++``--audio-crossfade-buffer=<seconds>``
++    Reserve additional decoded PCM lookahead for ``crossfade-loadfile``. Accepts
++    0 to 30 seconds, limited to 64 MiB according to the output format. Zero is
++    the default and leaves ordinary buffering and startup behavior unchanged.
++    This does not enable cross-fading or schedule playlist transitions by itself.
++
++    Set this before loading a file. Enabling it can require more initial decoding,
++    network buffering and memory, and buffered filter/speed changes may react
++    later. A cross-fade can only retain audio that has actually been decoded;
++    inspect ``audio-crossfade/available`` when deciding when to request one.
++    Changing the option during playback reconfigures the audio output.
++
+ ``--audio-stream-silence=<yes|no>``
+     Cash-grab consumer audio hardware (such as A/V receivers) often ignore
+     initial audio sent over HDMI. This can happen every time audio over HDMI
+diff --git a/audio/out/ao.c b/audio/out/ao.c
+index 4bbf807..2070c95 100644
+--- a/audio/out/ao.c
++++ b/audio/out/ao.c
+@@ -150,6 +150,8 @@ const struct m_sub_options ao_conf = {
+         {"audio-client-name", OPT_STRING(audio_client_name), .flags = UPDATE_AUDIO},
+         {"audio-buffer", OPT_DOUBLE(audio_buffer),
+             .flags = UPDATE_AUDIO, M_RANGE(0, 10)},
++        {"audio-crossfade-buffer", OPT_DOUBLE(audio_crossfade_buffer),
++            .flags = UPDATE_AUDIO, M_RANGE(0, 30)},
+         {"audio-set-media-role", OPT_BOOL(audio_set_media_role),
+             .flags = UPDATE_AUDIO},
+         {0}
+@@ -192,6 +194,7 @@ static struct ao *ao_alloc(bool probing, struct mpv_global *global,
+         .wakeup_ctx = wakeup_ctx,
+         .log = mp_log_new(ao, log, name),
+         .def_buffer = opts->audio_buffer,
++        .crossfade_buffer = opts->audio_crossfade_buffer,
+         .client_name = talloc_strdup(ao, opts->audio_client_name),
+         .set_media_role = opts->audio_set_media_role
+     };
+@@ -267,6 +270,12 @@ static struct ao *ao_init(bool probing, struct mpv_global *global,
+     if (ao->device_buffer)
+         MP_VERBOSE(ao, "device buffer: %d samples.\n", ao->device_buffer);
+     ao->buffer = MPMAX(ao->device_buffer, ao->def_buffer * ao->samplerate);
++    if (ao->crossfade_buffer > 0 && ao_can_fade(ao)) {
++        size_t frame_bytes = (size_t)ao->sstride * ao->num_planes;
++        int reserve = MPMIN(ao->crossfade_buffer * ao->samplerate,
++                            AO_CROSSFADE_MAX_BYTES / frame_bytes);
++        ao->buffer = MPMAX(ao->buffer, reserve);
++    }
+     ao->buffer = MPMAX(ao->buffer, 1);
+ 
+     int align = af_format_sample_alignment(ao->format);
+@@ -622,7 +631,24 @@ void ao_print_devices(struct mpv_global *global, struct mp_log *log,
+ 
+ void ao_set_gain(struct ao *ao, float gain)
+ {
+-    atomic_store(&ao->gain, gain);
++    ao_set_gains(ao, gain, 1);
++}
++
++void ao_set_gains(struct ao *ao, float volume, float track)
++{
++    mp_mutex_lock(&ao->fade_lock);
++    ao->volume_gain = volume;
++    ao->track_gain = track;
++    atomic_store(&ao->gain, volume * track);
++    mp_mutex_unlock(&ao->fade_lock);
++}
++
++float ao_get_track_gain(struct ao *ao)
++{
++    mp_mutex_lock(&ao->fade_lock);
++    float gain = ao->track_gain;
++    mp_mutex_unlock(&ao->fade_lock);
++    return gain;
+ }
+ 
+ bool ao_can_fade(struct ao *ao)
+@@ -699,39 +725,56 @@ void ao_pause_fade_clock(struct ao *ao, bool paused)
+ 
+ // Every plane uses the same envelope snapshot. Interleaved channels share one
+ // gain per frame, and integer output is rounded only after multiplying samples.
+-#define FADE_SAMPLES(type, expression)                                         \
++#define FADE_SAMPLES(type, center, expression)                                 \
+     do {                                                                     \
+         type *d = data;                                                      \
++        const type *old = mix && mix->data ?                                 \
++            (const void *)(mix->data + plane * mix->plane_size) : NULL;      \
+         for (int n = 0; n < frames; n++) {                                    \
+             double fraction = remaining ?                                   \
+                 MPMIN((double)n + 1, (double)remaining) / remaining : 1;      \
+-            double gain = volume * (start + (target - start) * fraction);     \
++            double fade = start + (target - start) * fraction;              \
++            double phase = old && mix->length > 0 ?                         \
++                MPMIN(1.0, (mix->progress + n + 1.0) / mix->length) : 0;     \
++            double out = old ? mix->start_gain *                            \
++                (mix->equal_power ? cos(phase * M_PI / 2) : 1 - phase) : 0; \
++            double in = old && mix->mixing ?                               \
++                (mix->equal_power ? sin(phase * M_PI / 2) : phase) : 0;      \
+             for (int c = 0; c < channels; c++) {                              \
+-                double sample = d[n * channels + c];                         \
++                double gain = volume * fade;                                \
++                double sample = old && n >= mix->incoming ?                 \
++                    (center) : d[n * channels + c];                          \
++                if (old && n < mix->frames) {                               \
++                    double previous = old[(mix->position + n) * channels + c]; \
++                    sample = (center) + ao->volume_gain *                   \
++                        ((sample - (center)) * in * ao->track_gain +        \
++                         (previous - (center)) * out * mix->track_gain);    \
++                    gain = fade;                                           \
++                }                                                          \
+                 d[n * channels + c] = (expression);                          \
+             }                                                               \
+         }                                                                   \
+     } while (0)
+ 
+-static void process_plane(struct ao *ao, void *data, int frames, int channels,
++static void process_plane(struct ao *ao, void *data, int plane, int frames, int channels,
+                           double volume, double start, double target,
+-                          int64_t remaining)
++                          int64_t remaining, struct ao_crossfade_mix *mix)
+ {
+     switch (af_fmt_from_planar(ao->format)) {
+     case AF_FORMAT_U8:
+-        FADE_SAMPLES(uint8_t, llrint(MPCLAMP((sample - 128) * gain + 128, 0, 255)));
++        FADE_SAMPLES(uint8_t, 128, llrint(MPCLAMP((sample - 128) * gain + 128, 0, 255)));
+         break;
+     case AF_FORMAT_S16:
+-        FADE_SAMPLES(int16_t, llrint(MPCLAMP(sample * gain, INT16_MIN, INT16_MAX)));
++        FADE_SAMPLES(int16_t, 0, llrint(MPCLAMP(sample * gain, INT16_MIN, INT16_MAX)));
+         break;
+     case AF_FORMAT_S32:
+-        FADE_SAMPLES(int32_t, llrint(MPCLAMP(sample * gain, INT32_MIN, INT32_MAX)));
++        FADE_SAMPLES(int32_t, 0, llrint(MPCLAMP(sample * gain, INT32_MIN, INT32_MAX)));
+         break;
+     case AF_FORMAT_FLOAT:
+-        FADE_SAMPLES(float, sample * gain);
++        FADE_SAMPLES(float, 0, sample * gain);
+         break;
+     case AF_FORMAT_DOUBLE:
+-        FADE_SAMPLES(double, sample * gain);
++        FADE_SAMPLES(double, 0, sample * gain);
+         break;
+     default:;
+         // all other sample formats are simply not supported
+@@ -739,20 +782,20 @@ static void process_plane(struct ao *ao, void *data, int frames, int channels,
+ }
+ 
+ void ao_post_process_data(struct ao *ao, void **data, int num_samples,
+-                          int64_t out_time_ns)
++                          int64_t out_time_ns, struct ao_crossfade_mix *mix)
+ {
+     if (!num_samples || !ao_can_fade(ao))
+         return;
+-    double volume = atomic_load_explicit(&ao->gain, memory_order_relaxed);
+     bool completed = false;
+     mp_mutex_lock(&ao->fade_lock);
++    double volume = atomic_load_explicit(&ao->gain, memory_order_relaxed);
+     bool planar = af_fmt_is_planar(ao->format);
+     int planes = planar ? ao->channels.num : 1;
+     int channels = planar ? 1 : ao->channels.num;
+-    if (volume != 1 || ao->fade_gain != 1 || ao->fade_remaining) {
++    if (volume != 1 || ao->fade_gain != 1 || ao->fade_remaining || (mix && mix->data)) {
+         for (int n = 0; n < planes; n++)
+-            process_plane(ao, data[n], num_samples, channels, volume,
+-                          ao->fade_gain, ao->fade_target, ao->fade_remaining);
++            process_plane(ao, data[n], n, num_samples, channels, volume,
++                          ao->fade_gain, ao->fade_target, ao->fade_remaining, mix);
+     }
+     if (ao->fade_remaining) {
+         int64_t count = MPMIN(ao->fade_remaining, num_samples);
+diff --git a/audio/out/ao.h b/audio/out/ao.h
+index 6015083..c0055b2 100644
+--- a/audio/out/ao.h
++++ b/audio/out/ao.h
+@@ -79,6 +79,7 @@ struct ao_opts {
+     char *audio_device;
+     char *audio_client_name;
+     double audio_buffer;
++    double audio_crossfade_buffer;
+     bool audio_set_media_role;
+ };
+ 
+@@ -95,6 +96,8 @@ const char *ao_get_description(struct ao *ao);
+ bool ao_untimed(struct ao *ao);
+ int ao_control(struct ao *ao, enum aocontrol cmd, void *arg);
+ void ao_set_gain(struct ao *ao, float gain);
++void ao_set_gains(struct ao *ao, float volume, float track);
++float ao_get_track_gain(struct ao *ao);
+ 
+ struct ao_fade_state {
+     double gain, target;
+@@ -105,6 +108,15 @@ struct ao_fade_state {
+ bool ao_set_fade(struct ao *ao, double target, double seconds);
+ bool ao_can_fade(struct ao *ao);
+ struct ao_fade_state ao_get_fade(struct ao *ao);
++
++struct ao_crossfade_state {
++    bool active, waiting, supported;
++    double remaining, available;
++};
++double ao_crossfade_capture(struct ao *ao, double seconds, bool equal_power);
++void ao_crossfade_commit(struct ao *ao, double max_seconds);
++void ao_crossfade_clear_input(struct ao *ao);
++struct ao_crossfade_state ao_get_crossfade(struct ao *ao);
+ double ao_get_delay(struct ao *ao);
+ void ao_reset(struct ao *ao);
+ void ao_start(struct ao *ao);
+diff --git a/audio/out/buffer.c b/audio/out/buffer.c
+index 5f94daf..6d583d7 100644
+--- a/audio/out/buffer.c
++++ b/audio/out/buffer.c
+@@ -68,6 +68,17 @@ struct buffer_state {
+                                 // and is considered as a temporary solution;
+                                 // DO NOT USE IT IN OTHER PLACES.
+ 
++    // Unplayed, filtered PCM from the outgoing file. Only an explicit
++    // crossfade-loadfile handoff retains this across a file replacement.
++    uint8_t *crossfade_data;
++    size_t crossfade_plane_size;
++    int crossfade_frames, crossfade_position, crossfade_length, crossfade_progress;
++    bool crossfade_waiting, crossfade_mixing, crossfade_equal_power;
++    double crossfade_track_gain;
++    double crossfade_start_gain;
++    int64_t crossfade_end_ns;
++    int64_t crossfade_paused_ns;
++
+     // "Push" AOs only (AOs with driver->write).
+     bool recover_pause;         // non-hw_paused: needs to recover delay
+     struct mp_pcm_state prepause_state;
+@@ -115,15 +126,62 @@ struct mp_async_queue *ao_get_queue(struct ao *ao)
+     return p->queue;
+ }
+ 
++static double crossfade_gain(struct buffer_state *p)
++{
++    if (!p->crossfade_length)
++        return 0;
++    double phase = MPMIN(1.0, p->crossfade_progress / (double)p->crossfade_length);
++    return p->crossfade_start_gain *
++        (p->crossfade_equal_power ? cos(phase * M_PI / 2) : 1 - phase);
++}
++
++// called locked; does not allocate, free storage or wait for the next decoder
++static int prepare_crossfade(struct ao *ao, int incoming, int samples,
++                             int64_t start_time_ns, struct ao_crossfade_mix *mix)
++{
++    struct buffer_state *p = ao->buffer_state;
++    int remaining = p->crossfade_frames - p->crossfade_position;
++    if (!p->playing || p->paused || remaining <= 0)
++        return incoming;
++    if (incoming && !p->crossfade_mixing) {
++        p->crossfade_start_gain = crossfade_gain(p);
++        p->crossfade_mixing = true;
++        p->crossfade_length = remaining;
++        p->crossfade_progress = 0;
++    }
++    int count = MPMIN(samples, remaining);
++    *mix = (struct ao_crossfade_mix){
++        .data = p->crossfade_data,
++        .plane_size = p->crossfade_plane_size,
++        .position = p->crossfade_position,
++        .frames = count,
++        .incoming = incoming,
++        .length = p->crossfade_length,
++        .progress = p->crossfade_progress,
++        .mixing = p->crossfade_mixing,
++        .equal_power = p->crossfade_equal_power,
++        .track_gain = p->crossfade_track_gain,
++        .start_gain = p->crossfade_start_gain,
++    };
++    p->crossfade_position += count;
++    p->crossfade_progress += count;
++    if (p->crossfade_position == p->crossfade_frames) {
++        p->crossfade_end_ns = start_time_ns + (int64_t)(count * 1e9 / ao->samplerate);
++        p->crossfade_waiting = false;
++        ao->wakeup_cb(ao->wakeup_ctx);
++    }
++    return MPMAX(incoming, count);
++}
++
+ // Special behavior with data==NULL: caller uses p->pending.
+ static int read_buffer(struct ao *ao, void **data, int samples, bool *eof,
+-                       bool pad_silence, int64_t start_time_ns)
++                       bool pad_silence, int64_t start_time_ns, bool process)
+ {
+     struct buffer_state *p = ao->buffer_state;
+     int pos = 0;
+     *eof = false;
+ 
+-    while (p->playing && !p->paused && pos < samples) {
++    while (p->playing && !p->paused && !p->crossfade_waiting && pos < samples) {
+         if (!p->pending || !mp_aframe_get_size(p->pending)) {
+             TA_FREEP(&p->pending);
+             struct mp_frame frame = mp_pin_out_read(p->input->pins[0]);
+@@ -160,11 +218,19 @@ static int read_buffer(struct ao *ao, void **data, int samples, bool *eof,
+         if (pd) {
+             int frames = mp_aframe_get_size(p->pending);
+             ao_post_process_data(ao, pd, frames,
+-                start_time_ns + (int64_t)(frames * 1e9 / ao->samplerate));
++                start_time_ns + (int64_t)(frames * 1e9 / ao->samplerate), NULL);
+         }
+         return 1;
+     }
+ 
++    struct ao_crossfade_mix mix = {0};
++    if (process) {
++        int mixed = prepare_crossfade(ao, pos, samples, start_time_ns, &mix);
++        if (mixed > pos)
++            *eof = false;
++        pos = mixed;
++    }
++
+     // pad with silence (underflow/paused/eof)
+     if (pad_silence) {
+         for (int n = 0; n < ao->num_planes; n++) {
+@@ -174,11 +240,115 @@ static int read_buffer(struct ao *ao, void **data, int samples, bool *eof,
+         }
+     }
+ 
+-    ao_post_process_data(ao, data, pos,
+-        start_time_ns + (int64_t)(pos * 1e9 / ao->samplerate));
++    if (process)
++        ao_post_process_data(ao, data, pos,
++            start_time_ns + (int64_t)(pos * 1e9 / ao->samplerate), &mix);
+     return pos;
+ }
+ 
++struct ao_crossfade_state ao_get_crossfade(struct ao *ao)
++{
++    struct buffer_state *p = ao->buffer_state;
++    mp_mutex_lock(&p->lock);
++    int frames = p->crossfade_frames - p->crossfade_position;
++    int64_t available = mp_async_queue_get_samples(p->queue);
++    if (p->pending)
++        available += mp_aframe_get_size(p->pending);
++    int64_t now = p->crossfade_paused_ns ? p->crossfade_paused_ns : mp_time_ns();
++    double queued = MPMAX(0, MP_TIME_NS_TO_S(p->crossfade_end_ns - now));
++    struct ao_crossfade_state state = {
++        .active = frames > 0 || queued > 0,
++        .waiting = frames > 0 && p->crossfade_waiting,
++        .remaining = frames / (double)ao->samplerate + queued,
++        .available = available / (double)ao->samplerate,
++        .supported = ao_can_fade(ao) && !ao->driver->write_frames && !ao->encode_lavc_ctx,
++    };
++    mp_mutex_unlock(&p->lock);
++    return state;
++}
++
++double ao_crossfade_capture(struct ao *ao, double seconds, bool equal_power)
++{
++    if (!ao_can_fade(ao) || ao->driver->write_frames || !isfinite(seconds) ||
++        seconds <= 0 || seconds > 30)
++        return 0;
++    // Bound retained memory independently of sample rate and channel count.
++    size_t frame_bytes = (size_t)ao->sstride * ao->num_planes;
++    int frames = MPMIN(seconds * ao->samplerate, AO_CROSSFADE_MAX_BYTES / frame_bytes);
++    if (frames <= 0)
++        return 0;
++    size_t plane_size = (size_t)frames * ao->sstride;
++    uint8_t *storage = talloc_size(ao, plane_size * ao->num_planes);
++    // Commit pages outside the output lock; the audio callback never allocates.
++    memset(storage, 0, plane_size * ao->num_planes);
++    void *planes[MP_NUM_CHANNELS];
++    for (int n = 0; n < ao->num_planes; n++)
++        planes[n] = storage + plane_size * n;
++    struct buffer_state *p = ao->buffer_state;
++    mp_mutex_lock(&p->lock);
++    int captured = 0;
++    if (p->playing && !p->paused &&
++        p->crossfade_position == p->crossfade_frames && p->crossfade_end_ns <= mp_time_ns()) {
++        bool eof;
++        captured = read_buffer(ao, planes, frames, &eof, false, 0, false);
++    }
++    if (captured > 0) {
++        TA_FREEP(&p->crossfade_data);
++        p->crossfade_data = storage;
++        p->crossfade_plane_size = plane_size;
++        p->crossfade_frames = captured;
++        p->crossfade_position = 0;
++        p->crossfade_progress = 0;
++        p->crossfade_length = captured;
++        p->crossfade_start_gain = 1;
++        p->crossfade_waiting = true;
++        p->crossfade_mixing = false;
++        p->crossfade_equal_power = equal_power;
++        p->crossfade_track_gain = ao_get_track_gain(ao);
++        p->crossfade_end_ns = 0;
++        TA_FREEP(&p->pending);
++        mp_async_queue_reset(p->queue);
++        mp_filter_reset(p->filter_root);
++        mp_async_queue_resume_reading(p->queue);
++    }
++    mp_mutex_unlock(&p->lock);
++    if (!captured)
++        talloc_free(storage);
++    return captured / (double)ao->samplerate;
++}
++
++void ao_crossfade_commit(struct ao *ao, double max_seconds)
++{
++    struct buffer_state *p = ao->buffer_state;
++    mp_mutex_lock(&p->lock);
++    if (isfinite(max_seconds) && max_seconds > 0) {
++        int remaining = p->crossfade_frames - p->crossfade_position;
++        int frames = MPMIN(remaining, max_seconds * ao->samplerate);
++        if (frames < remaining) {
++            p->crossfade_start_gain = crossfade_gain(p);
++            p->crossfade_length = frames;
++            p->crossfade_progress = 0;
++        }
++        p->crossfade_frames = p->crossfade_position + frames;
++    }
++    p->crossfade_waiting = false;
++    mp_mutex_unlock(&p->lock);
++    ao_wakeup(ao);
++}
++
++void ao_crossfade_clear_input(struct ao *ao)
++{
++    struct buffer_state *p = ao->buffer_state;
++    mp_mutex_lock(&p->lock);
++    // An initial seek for the incoming file only discards its producer data.
++    // The outgoing reserve and already queued hardware samples keep playing.
++    TA_FREEP(&p->pending);
++    mp_async_queue_reset(p->queue);
++    mp_filter_reset(p->filter_root);
++    mp_async_queue_resume_reading(p->queue);
++    mp_mutex_unlock(&p->lock);
++}
++
+ static int ao_read_data_locked(struct ao *ao, void **data, int samples,
+                                int64_t out_time_ns, bool *eof, bool pad_silence)
+ {
+@@ -187,7 +357,7 @@ static int ao_read_data_locked(struct ao *ao, void **data, int samples,
+ 
+     int64_t start_time_ns = out_time_ns -
+         (int64_t)(samples * 1e9 / ao->samplerate);
+-    int pos = read_buffer(ao, data, samples, eof, pad_silence, start_time_ns);
++    int pos = read_buffer(ao, data, samples, eof, pad_silence, start_time_ns, true);
+ 
+     if (pos > 0)
+         p->end_time_ns = out_time_ns;
+@@ -332,6 +502,11 @@ void ao_reset(struct ao *ao)
+ 
+     mp_mutex_lock(&p->lock);
+ 
++    TA_FREEP(&p->crossfade_data);
++    p->crossfade_frames = p->crossfade_position = 0;
++    p->crossfade_waiting = p->crossfade_mixing = false;
++    p->crossfade_end_ns = 0;
++    p->crossfade_paused_ns = 0;
+     TA_FREEP(&p->pending);
+     mp_async_queue_reset(p->queue);
+     mp_filter_reset(p->filter_root);
+@@ -438,6 +613,14 @@ void ao_set_paused(struct ao *ao, bool paused, bool eof)
+         }
+         wakeup = true;
+     }
++    int64_t now = mp_time_ns();
++    if (paused && !p->paused) {
++        p->crossfade_paused_ns = now;
++    } else if (!paused && p->paused) {
++        if (p->crossfade_end_ns > p->crossfade_paused_ns)
++            p->crossfade_end_ns += now - p->crossfade_paused_ns;
++        p->crossfade_paused_ns = 0;
++    }
+     p->paused = paused;
+     ao_pause_fade_clock(ao, paused);
+ 
+@@ -655,7 +838,7 @@ static bool ao_play_data(struct ao *ao)
+         (int64_t)(MPMAX(0, state.delay) * 1e9);
+     if (ao->driver->write_frames) {
+         TA_FREEP(&p->pending);
+-        samples = read_buffer(ao, NULL, 1, &got_eof, false, start_time_ns);
++        samples = read_buffer(ao, NULL, 1, &got_eof, false, start_time_ns, true);
+         planes = (void **)&p->pending;
+     } else {
+         if (!realloc_buf(ao, space)) {
+@@ -672,7 +855,7 @@ static bool ao_play_data(struct ao *ao)
+         }
+ 
+         if (!samples) {
+-            samples = read_buffer(ao, planes, space, &got_eof, true, start_time_ns);
++            samples = read_buffer(ao, planes, space, &got_eof, true, start_time_ns, true);
+             if (p->paused || (ao->stream_silence && !p->playing))
+                 samples = space; // read_buffer() sets remainder to silent
+         }
+diff --git a/audio/out/internal.h b/audio/out/internal.h
+index 50009a8..48721d4 100644
+--- a/audio/out/internal.h
++++ b/audio/out/internal.h
+@@ -24,6 +24,8 @@
+ #include "audio/out/ao.h"
+ #include "osdep/threads.h"
+ 
++#define AO_CROSSFADE_MAX_BYTES (64 * 1024 * 1024)
++
+ /* global data used by ao.c and ao drivers */
+ struct ao {
+     int samplerate;
+@@ -71,11 +73,13 @@ struct ao {
+     // Independent of user volume; advanced only by PCM frames sent to the AO.
+     mp_mutex fade_lock;
+     double fade_gain, fade_target;
++    float volume_gain, track_gain;
+     int64_t fade_remaining;
+     int64_t fade_end_ns, fade_paused_ns;
+ 
+     int buffer;
+     double def_buffer;
++    double crossfade_buffer;
+     struct buffer_state *buffer_state;
+ };
+ 
+@@ -221,8 +225,17 @@ bool ao_chmap_sel_get_def(struct ao *ao, const struct mp_chmap_sel *s,
+ void ao_device_list_add(struct ao_device_list *list, struct ao *ao,
+                         struct ao_device_desc *e);
+ 
++struct ao_crossfade_mix {
++    const uint8_t *data;
++    size_t plane_size;
++    int position, frames, incoming, length, progress;
++    bool mixing, equal_power;
++    double track_gain;
++    double start_gain;
++};
++
+ void ao_post_process_data(struct ao *ao, void **data, int num_samples,
+-                          int64_t out_time_ns);
++                          int64_t out_time_ns, struct ao_crossfade_mix *mix);
+ void ao_reset_fade_clock(struct ao *ao);
+ void ao_pause_fade_clock(struct ao *ao, bool paused);
+ 
+diff --git a/player/audio.c b/player/audio.c
+index 073bf11..22de16a 100644
+--- a/player/audio.c
++++ b/player/audio.c
+@@ -28,6 +28,7 @@
+ #include "common/encode.h"
+ #include "options/options.h"
+ #include "common/common.h"
++#include "common/playlist.h"
+ #include "osdep/timer.h"
+ 
+ #include "audio/format.h"
+@@ -170,18 +171,22 @@ static float compute_replaygain(struct MPContext *mpctx)
+     return rgain;
+ }
+ 
+-float audio_get_gain(struct MPContext *mpctx)
++static float audio_get_volume_gain(struct MPContext *mpctx)
+ {
+     struct MPOpts *opts = mpctx->opts;
+     float gain = MPMAX(opts->softvol_volume / 100.0, 0);
+     gain = pow(gain, 3);
+-    gain *= compute_replaygain(mpctx);
+     gain *= db_gain(opts->softvol_gain);
+     if (opts->softvol_mute)
+         gain = 0.0;
+     return gain;
+ }
+ 
++float audio_get_gain(struct MPContext *mpctx)
++{
++    return audio_get_volume_gain(mpctx) * compute_replaygain(mpctx);
++}
++
+ // Called when opts->softvol_volume or opts->softvol_mute were changed.
+ void audio_update_volume(struct MPContext *mpctx)
+ {
+@@ -189,8 +194,7 @@ void audio_update_volume(struct MPContext *mpctx)
+     if (!ao_c || !ao_c->ao)
+         return;
+ 
+-    float gain = audio_get_gain(mpctx);
+-    ao_set_gain(ao_c->ao, gain);
++    ao_set_gains(ao_c->ao, audio_get_volume_gain(mpctx), compute_replaygain(mpctx));
+ }
+ 
+ // Fade transport is confined to the core thread. The AO only advances its PCM
+@@ -558,6 +562,17 @@ static void ao_chain_set_ao(struct ao_chain *ao_c, struct ao *ao)
+     if (ao_c->filter->ao_needs_update)
+         mp_output_chain_set_ao(ao_c->filter, ao_c->ao);
+ 
++    struct MPContext *mpctx = ao_c->mpctx;
++    if (mpctx->audio_crossfade_entry_id && mpctx->playing &&
++        mpctx->playing->id == mpctx->audio_crossfade_entry_id) {
++        double length = get_time_length(mpctx);
++        double position = get_current_time(mpctx);
++        if (position != MP_NOPTS_VALUE)
++            length -= MPMAX(0, position);
++        ao_crossfade_commit(ao, length);
++        mpctx->audio_crossfade_entry_id = 0;
++    }
++
+     mp_filter_wakeup(ao_c->ao_filter);
+ }
+ 
+@@ -588,12 +603,22 @@ static int reinit_audio_filters_and_output(struct MPContext *mpctx)
+             mp_aframe_set_chmap(out_fmt, &opts->audio_output_channels.chmaps[0]);
+     }
+ 
++    bool crossfade_pcm = af_fmt_is_int(mp_aframe_get_format(out_fmt)) ||
++                         af_fmt_is_float(mp_aframe_get_format(out_fmt));
++    if (mpctx->audio_crossfade_entry_id && mpctx->ao && !crossfade_pcm) {
++        ao_reset(mpctx->ao);
++        mpctx->audio_crossfade_entry_id = 0;
++        uninit_audio_out(mpctx);
++    }
++
+     // Weak gapless audio: if the filter output format is the same as the
+     // previous one, keep the AO and don't reinit anything.
+     // Strong gapless: always keep the AO
+     if ((mpctx->ao_filter_fmt && mpctx->ao && opts->gapless_audio < 0 &&
+          keep_weak_gapless_format(mpctx->ao_filter_fmt, out_fmt)) ||
+-        (mpctx->ao && opts->gapless_audio > 0))
++        (mpctx->ao && opts->gapless_audio > 0) ||
++        (mpctx->ao && mpctx->audio_crossfade_entry_id &&
++         ao_can_fade(mpctx->ao) && crossfade_pcm))
+     {
+         ao_chain_set_ao(ao_c, mpctx->ao);
+         talloc_free(out_fmt);
+@@ -614,6 +639,12 @@ static int reinit_audio_filters_and_output(struct MPContext *mpctx)
+         return 0;
+     }
+ 
++    if (mpctx->audio_crossfade_entry_id && mpctx->ao) {
++        // An incompatible output must fall back immediately, not drain a long
++        // outgoing reserve before opening the replacement device.
++        ao_reset(mpctx->ao);
++        mpctx->audio_crossfade_entry_id = 0;
++    }
+     uninit_audio_out(mpctx);
+ 
+     int out_rate = mp_aframe_get_rate(out_fmt);
+@@ -1191,9 +1222,23 @@ void fill_audio_out_buffers(struct MPContext *mpctx)
+         audio_start_ao(mpctx); // in case it got delayed
+ }
+ 
++bool audio_crossfade_handoff(struct MPContext *mpctx)
++{
++    return mpctx->ao && mpctx->audio_crossfade_entry_id &&
++        mpctx->stop_play == PT_CURRENT_ENTRY && mpctx->playlist->current &&
++        mpctx->playlist->current->id == mpctx->audio_crossfade_entry_id;
++}
++
+ // Drop data queued for output, or which the AO is currently outputting.
+ void clear_audio_output_buffers(struct MPContext *mpctx)
+ {
++    if (mpctx->ao && mpctx->audio_crossfade_entry_id && mpctx->playing &&
++        mpctx->playing->id == mpctx->audio_crossfade_entry_id && !mpctx->restart_complete &&
++        !mpctx->stop_play) {
++        ao_crossfade_clear_input(mpctx->ao);
++        return;
++    }
++    mpctx->audio_crossfade_entry_id = 0;
+     if (mpctx->ao)
+         ao_reset(mpctx->ao);
+ }
+diff --git a/player/command.c b/player/command.c
+index 2bed4ab..29271fd 100644
+--- a/player/command.c
++++ b/player/command.c
+@@ -907,6 +907,24 @@ static int mp_property_audio_fade(void *ctx, struct m_property *prop,
+     return m_property_read_sub(props, action, arg);
+ }
+ 
++static int mp_property_audio_crossfade(void *ctx, struct m_property *prop,
++                                      int action, void *arg)
++{
++    MPContext *mpctx = ctx;
++    struct ao_crossfade_state state = {0};
++    if (mpctx->ao)
++        state = ao_get_crossfade(mpctx->ao);
++    struct m_sub_property props[] = {
++        {"active", SUB_PROP_BOOL(state.active)},
++        {"waiting", SUB_PROP_BOOL(state.waiting)},
++        {"remaining", SUB_PROP_DOUBLE(state.remaining)},
++        {"available", SUB_PROP_DOUBLE(state.available)},
++        {"supported", SUB_PROP_BOOL(state.supported)},
++        {0}
++    };
++    return m_property_read_sub(props, action, arg);
++}
++
+ static bool time_remaining(MPContext *mpctx, double *remaining)
+ {
+     double len = get_time_length(mpctx);
+@@ -4730,6 +4748,7 @@ static const struct m_property mp_properties_base[] = {
+     {"time-remaining", mp_property_remaining},
+     {"audio-pts", mp_property_audio_pts},
+     {"audio-fade", mp_property_audio_fade},
++    {"audio-crossfade", mp_property_audio_crossfade},
+     {"playtime-remaining", mp_property_playtime_remaining},
+     M_PROPERTY_ALIAS("playback-time", "time-pos"),
+     {"remaining-file-loops", mp_property_remaining_file_loops},
+@@ -4944,7 +4963,7 @@ static const char *const *const mp_event_property_change[] = {
+     E(MP_EVENT_TRACKS_CHANGED, "track-list", "current-tracks"),
+     E(MP_EVENT_TRACK_SWITCHED, "track-list", "current-tracks"),
+     E(MPV_EVENT_IDLE, "*"),
+-    E(MPV_EVENT_TICK, "time-pos", "audio-pts", "audio-fade", "stream-pos", "avsync",
++    E(MPV_EVENT_TICK, "time-pos", "audio-pts", "audio-fade", "audio-crossfade", "stream-pos", "avsync",
+       "percent-pos", "time-remaining", "playtime-remaining", "playback-time",
+       "estimated-vf-fps", "total-avsync-change", "audio-speed-correction",
+       "video-speed-correction", "vo-delayed-frame-count", "mistimed-frame-count",
+@@ -6603,6 +6622,42 @@ static void cmd_loadfile(void *p)
+     mp_wakeup_core(mpctx);
+ }
+ 
++static void cmd_crossfade_loadfile(void *p)
++{
++    struct mp_cmd_ctx *cmd = p;
++    MPContext *mpctx = cmd->mpctx;
++    double seconds = cmd->args[1].v.d;
++    if (!isfinite(seconds)) {
++        cmd->success = false;
++        return;
++    }
++    if (mpctx->opts->position_save_on_quit)
++        mp_write_watch_later_conf(mpctx);
++    char *path = mp_get_user_path(NULL, mpctx->global, cmd->args[0].v.s);
++    struct playlist_entry *entry = playlist_entry_new(path);
++    talloc_free(path);
++    char **pairs = cmd->args[3].v.str_list;
++    for (int i = 0; pairs && pairs[i] && pairs[i + 1]; i += 2)
++        playlist_entry_add_param(entry, bstr0(pairs[i]), bstr0(pairs[i + 1]));
++
++    double captured = 0;
++    if (mpctx->ao && !get_internal_paused(mpctx) && !mpctx->encode_lavc_ctx)
++        captured = ao_crossfade_capture(mpctx->ao, seconds, cmd->args[2].v.i);
++    audio_fade_cancel(mpctx, false);
++    audio_fade_set(mpctx, 1, captured > 0 ? MPMIN(0.005, seconds) : 0);
++    playlist_clear(mpctx->playlist);
++    playlist_insert_at(mpctx->playlist, entry, NULL);
++    mpctx->audio_crossfade_entry_id = captured > 0 ? entry->id : 0;
++    mp_set_playlist_entry(mpctx, entry);
++
++    node_init(&cmd->result, MPV_FORMAT_NODE_MAP, NULL);
++    node_map_add_int64(&cmd->result, "playlist_entry_id", entry->id);
++    node_map_add_double(&cmd->result, "captured", captured);
++    mp_notify(mpctx, MP_EVENT_CHANGE_PLAYLIST, NULL);
++    mp_notify_property(mpctx, "audio-crossfade");
++    mp_wakeup_core(mpctx);
++}
++
+ static void cmd_loadlist(void *p)
+ {
+     struct mp_cmd_ctx *cmd = p;
+@@ -7664,6 +7719,15 @@ const struct mp_cmd_def mp_cmds[] = {
+     { "fade-pause", cmd_fade_pause,
+         { {"duration", OPT_DOUBLE(v.d), M_RANGE(0, 60)} },
+     },
++    { "crossfade-loadfile", cmd_crossfade_loadfile,
++        {
++            {"url", OPT_STRING(v.s)},
++            {"duration", OPT_DOUBLE(v.d), M_RANGE(0, 30)},
++            {"curve", OPT_CHOICE(v.i, {"linear", 0}, {"equal-power", 1}),
++                OPTDEF_INT(0)},
++            {"options", OPT_KEYVALUELIST(v.str_list), .flags = MP_CMD_OPT_ARG},
++        },
++    },
+     { "fade-play", cmd_fade_play,
+         { {"duration", OPT_DOUBLE(v.d), M_RANGE(0, 60)} },
+     },
+diff --git a/player/core.h b/player/core.h
+index 1a8f08e..1b17691 100644
+--- a/player/core.h
++++ b/player/core.h
+@@ -348,6 +348,7 @@ typedef struct MPContext {
+     bool audio_fade_seek_paused;
+     double audio_fade_seconds;
+     double audio_fade_seek_target;
++    int64_t audio_crossfade_entry_id;
+ 
+     struct vo_chain *vo_chain;
+ 
+@@ -546,6 +547,7 @@ bool audio_fade_seek(struct MPContext *mpctx, double target, double seconds,
+ bool audio_fade_paused(struct MPContext *mpctx);
+ void audio_fade_update(struct MPContext *mpctx);
+ void audio_fade_restart(struct MPContext *mpctx);
++bool audio_crossfade_handoff(struct MPContext *mpctx);
+ void reload_audio_output(struct MPContext *mpctx);
+ void audio_start_ao(struct MPContext *mpctx);
+ 
+diff --git a/player/loadfile.c b/player/loadfile.c
+index 4e93562..12fb1de 100644
+--- a/player/loadfile.c
++++ b/player/loadfile.c
+@@ -1851,6 +1851,14 @@ static void play_current_file(struct MPContext *mpctx)
+ 
+     mpctx->playing = mpctx->playlist->current;
+     mp_assert(mpctx->playing);
++    if (mpctx->audio_crossfade_entry_id &&
++        mpctx->playing->id != mpctx->audio_crossfade_entry_id) {
++        // Redirects and unrelated playlist changes cannot consume another
++        // entry's retained audio handoff.
++        mpctx->audio_crossfade_entry_id = 0;
++        if (mpctx->ao)
++            ao_reset(mpctx->ao);
++    }
+     mp_assert(mpctx->playing->filename);
+     mpctx->playing->reserved += 1;
+ 
+@@ -2111,7 +2119,7 @@ terminate_playback:
+     if (!mpctx->stop_play)
+         mpctx->stop_play = PT_ERROR;
+ 
+-    if (mpctx->stop_play != AT_END_OF_FILE)
++    if (mpctx->stop_play != AT_END_OF_FILE && !audio_crossfade_handoff(mpctx))
+         clear_audio_output_buffers(mpctx);
+ 
+     update_core_idle_state(mpctx);
+@@ -2128,7 +2136,7 @@ terminate_playback:
+     uninit_audio_chain(mpctx);
+     uninit_video_chain(mpctx);
+     uninit_sub_all(mpctx);
+-    if (!opts->gapless_audio && !mpctx->encode_lavc_ctx)
++    if (!opts->gapless_audio && !mpctx->encode_lavc_ctx && !audio_crossfade_handoff(mpctx))
+         uninit_audio_out(mpctx);
+ 
+     mpctx->playback_initialized = false;
+@@ -2337,6 +2345,13 @@ void mp_play_files(struct MPContext *mpctx)
+ void mp_set_playlist_entry(struct MPContext *mpctx, struct playlist_entry *e)
+ {
+     mp_assert(!e || playlist_entry_to_index(mpctx->playlist, e) >= 0);
++    if (mpctx->ao && (!e || e->id != mpctx->audio_crossfade_entry_id)) {
++        // Only the explicit handoff may retain outgoing PCM. Stop, ordinary
++        // navigation, and replacement requests must not drain an old overlap.
++        if (ao_get_crossfade(mpctx->ao).active)
++            ao_reset(mpctx->ao);
++        mpctx->audio_crossfade_entry_id = 0;
++    }
+     mpctx->playlist->current = e;
+     mpctx->playlist->current_was_replaced = false;
+     mp_notify(mpctx, MP_EVENT_CHANGE_PLAYLIST, NULL);
+diff --git a/player/playloop.c b/player/playloop.c
+index 5b43dee..ccd7f69 100644
+--- a/player/playloop.c
++++ b/player/playloop.c
+@@ -233,8 +233,10 @@ void step_frame_mute(struct MPContext *mpctx, bool mute)
+     if (!mpctx->ao_chain || !mpctx->ao_chain->ao)
+         return;
+ 
+-    float gain = mute ? 0 : audio_get_gain(mpctx);
+-    ao_set_gain(mpctx->ao_chain->ao, gain);
++    if (mute)
++        ao_set_gain(mpctx->ao_chain->ao, 0);
++    else
++        audio_update_volume(mpctx);
+ }
+ 
+ // Update the sparse video state during playback.
+-- 
+2.54.0.windows.1
+
