@@ -23,7 +23,7 @@ Every variant builds a shared **libmpv** client library, without the standalone
 | `lgpl-shared` | LGPL | Separate FFmpeg DLLs |
 | `all` | All four variants | Both linkage modes |
 
-For Luna Player's next DVD-capable bundle, select **`64bit-v2`**, **`gpl-shared`** and
+For a GPL build with disc support, select **`64bit-v2`**, **`gpl-shared`** and
 **`clang`**. Leave **Publish a release** disabled for candidate builds. The new
 archives are named `mpv-dev-gpl-shared-x86_64-v2-...7z` and
 `ffmpeg-gpl-shared-x86_64-v2-...7z`; both shared variants include ffmpeg.exe and the
@@ -44,12 +44,12 @@ layer and does not alter the license profile.
 | Removed feature/library | Consequence |
 | --- | --- |
 | SDL2 | No MPV gamepad input; Windows keyboard/audio paths remain. |
-| OpenAL | No alternative OpenAL output or FFmpeg OpenAL capture; Luna records through NAudio/Media Foundation. |
+| OpenAL | No alternative OpenAL output or FFmpeg OpenAL capture. |
 | VapourSynth / AviSynth | No script-based video processing or script inputs. |
 | Sixel | No video output in Sixel-compatible terminals. |
 | Lua / MuJS | No MPV scripting, built-in Lua tools or JavaScript extensions. |
 | libaom | No libaom AV1 encoder; SVT-AV1 encoding and dav1d/native AV1 decoding remain. |
-| Rubber Band | No alternative Rubber Band processing; Luna's scaletempo2 speed/pitch controls remain. |
+| Rubber Band | No alternative Rubber Band processing; scaletempo2 speed/pitch controls remain. |
 | Direct3D 9 | No legacy renderer; Direct3D 11 and OpenGL remain. |
 | GPL-only native FFmpeg filters | Match the LGPL filter set rather than adding cropdetect, delogo, hqdn3d and other GPL-only video filters. |
 
@@ -73,14 +73,13 @@ entering the GPL profile. Other reductions require explicit approval.
 SoundFlow's roughly 7.7 MB native wrapper is an audio-focused static FFmpeg build
 with selected audio decoders and file/pipe I/O. Its configuration omits video,
 networking, hardware acceleration, filters and DVD-Audio MLP/TrueHD decoding, so it
-is not a compatible replacement for Luna's full media stack. Size savings from
+is not a compatible replacement for this full media build. Size savings from
 these changes need measurement after GitHub produces new artifacts.
 
-Before adopting script-free binaries, Luna must make `osc=false` and the metadata
-probe's `load_scripts=false` optional initialization settings. Ignore only
-libmpv's `OptionNotFound` for explicitly optional settings; keep other errors strict.
-The build workflow does not update Luna's bundled binaries or certify runtime
-playback. Candidate artifacts need subsequent playback, export and disc testing.
+Clients adopting script-free binaries should treat `osc=false` and
+`load_scripts=false` as optional initialization settings. Ignore only
+`MPV_ERROR_OPTION_NOT_FOUND` for explicitly optional settings; keep other errors
+strict. Candidate artifacts need subsequent playback, export and disc testing.
 
 ## Output-mixer fading
 
@@ -164,10 +163,6 @@ to the retained output format; incompatible devices are reopened normally.
 Video is not cross-faded. Stop, seek and unrelated file navigation discard the
 overlap rather than draining it. The command replaces the playlist like
 `loadfile ... replace`, and does not automatically schedule transitions.
-
-Luna does not enable this yet. Its wrapper exposes `SetAutomaticCrossfade` and
-`CrossfadeLoadFile` for the future feature; Luna's preferences and playlist
-behavior are unchanged.
 
 ## Automatic builds
 
