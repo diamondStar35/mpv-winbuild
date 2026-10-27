@@ -10,16 +10,77 @@ Based on <https://github.com/shinchiro/mpv-winbuild-cmake>.
 
 ## Manual builds
 
-Open **Actions**, select the **MPV** workflow, then select **Run workflow**. Choose one build variant:
+Open **Actions**, select the **MPV** workflow, then select **Run workflow**. The default
+CPU target is `64bit-v2`; baseline x64, V3, 32-bit and ARM64 remain selectable.
+Every variant builds a shared **libmpv** client library, without the standalone
+`mpv.exe`/`mpv.com` player, registration scripts or PDF manual.
 
-- `gpl`: the normal upstream build.
-- `lgpl`: the static LGPL libmpv build.
-- `lgpl-shared`: the LGPL libmpv build with shared FFmpeg libraries.
-- `all`: all three variants.
+| Variant | License profile | FFmpeg linkage |
+| --- | --- | --- |
+| `gpl` | GPL | Static inside libmpv and ffmpeg.exe |
+| `gpl-shared` | GPL | Separate FFmpeg DLLs |
+| `lgpl` | LGPL | Static inside libmpv and ffmpeg.exe |
+| `lgpl-shared` | LGPL | Separate FFmpeg DLLs |
+| `all` | All four variants | Both linkage modes |
 
-For a Luna Player build, select `64bit-v2` and `lgpl-shared`. Leave **Publish a release** disabled for the first test build; enable it after that build succeeds.
+For Luna Player's next DVD-capable bundle, select **`64bit-v2`**, **`gpl-shared`** and
+**`clang`**. Leave **Publish a release** disabled for candidate builds. The new
+archives are named `mpv-dev-gpl-shared-x86_64-v2-...7z` and
+`ffmpeg-gpl-shared-x86_64-v2-...7z`; both shared variants include ffmpeg.exe and the
+FFmpeg DLLs. Stale static FFmpeg archives are removed before linking libmpv.
 
-A new fork has no compiler or build caches. To bootstrap them, manually run the **LLVM** workflow once with the same target and variant; it dispatches the **toolchain** workflow, which then dispatches **MPV**. After that, run **MPV** directly for normal builds.
+A new fork has no compiler or build caches. To bootstrap them, manually run the
+**LLVM** workflow with the same target and variant; it forwards them through
+**toolchain** to **MPV**. Existing installations can run **MPV** directly.
+Build caches include compiler, CPU, variant and recipe revision so profiles do
+not reuse incompatible installed dependencies. Required patch failures stop the build.
+
+## Approved feature reductions
+
+The four variants share one lean configuration. GPL specialization adds disc
+readers and the existing additional codecs/protocols; shared linkage is a separate
+layer and does not alter the license profile.
+
+| Removed feature/library | Consequence |
+| --- | --- |
+| SDL2 | No MPV gamepad input; Windows keyboard/audio paths remain. |
+| OpenAL | No alternative OpenAL output or FFmpeg OpenAL capture; Luna records through NAudio/Media Foundation. |
+| VapourSynth / AviSynth | No script-based video processing or script inputs. |
+| Sixel | No video output in Sixel-compatible terminals. |
+| Lua / MuJS | No MPV scripting, built-in Lua tools or JavaScript extensions. |
+| libaom | No libaom AV1 encoder; SVT-AV1 encoding and dav1d/native AV1 decoding remain. |
+| Rubber Band | No alternative Rubber Band processing; Luna's scaletempo2 speed/pitch controls remain. |
+| Direct3D 9 | No legacy renderer; Direct3D 11 and OpenGL remain. |
+| GPL-only native FFmpeg filters | Match the LGPL filter set rather than adding cropdetect, delogo, hqdn3d and other GPL-only video filters. |
+
+Keep libbs2b headphone crossfeed and libmysofa SOFA/HRTF processing in both profiles.
+LZO archive support remains **enabled in GPL only**. GPL enables DVD-Audio/DVD-Video
+and retains its additional codec/protocol libraries, including x264/x265 and SRT/SSH.
+LGPL keeps those existing license-sensitive exclusions.
+
+Keep the existing native codecs, containers, parsers, bitstream filters, network
+protocols, hardware acceleration and conversion/export paths. Font/text libraries,
+libass, subrandr (SRV3/WebVTT subtitles), image codecs including JPEG XL, color
+management and the Direct3D 11/OpenGL shader dependencies remain. Vulkan stays
+disabled, including FFmpeg's Vulkan-dependent libplacebo filter; MPV's libplacebo
+renderer remains. All four native fade/transport/crossfade patches are required.
+
+`scripts/check-profile.py` validates the resolved recipes before building and checks
+the source revision's GPL-filter dependencies and installed shared-library families
+afterward. Newly introduced GPL-only filters require review instead of silently
+entering the GPL profile. Other reductions require explicit approval.
+
+SoundFlow's roughly 7.7 MB native wrapper is an audio-focused static FFmpeg build
+with selected audio decoders and file/pipe I/O. Its configuration omits video,
+networking, hardware acceleration, filters and DVD-Audio MLP/TrueHD decoding, so it
+is not a compatible replacement for Luna's full media stack. Size savings from
+these changes need measurement after GitHub produces new artifacts.
+
+Before adopting script-free binaries, Luna must make `osc=false` and the metadata
+probe's `load_scripts=false` optional initialization settings. Ignore only
+libmpv's `OptionNotFound` for explicitly optional settings; keep other errors strict.
+The build workflow does not update Luna's bundled binaries or certify runtime
+playback. Candidate artifacts need subsequent playback, export and disc testing.
 
 ## Output-mixer fading
 

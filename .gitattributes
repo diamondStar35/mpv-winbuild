@@ -1,0 +1,2 @@
+# Mail-format patches require space-prefixed context and signature separator lines.
+*.patch -whitespace

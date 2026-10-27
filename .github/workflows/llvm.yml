@@ -22,7 +22,7 @@ on:
       build_target:
         description: "Toolchain build target"
         required: false
-        default: "all-64bit"
+        default: "64bit-v2"
         type: choice
         options:
         - 32bit
@@ -39,6 +39,7 @@ on:
         type: choice
         options:
         - gpl
+        - gpl-shared
         - lgpl
         - lgpl-shared
         - all

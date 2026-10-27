@@ -9,7 +9,7 @@ on:
       build_target:
         description: "Build target"
         required: false
-        default: "all-64bit"
+        default: "64bit-v2"
         type: choice
         options:
         - 32bit
@@ -33,6 +33,7 @@ on:
         type: choice
         options:
         - gpl
+        - gpl-shared
         - lgpl
         - lgpl-shared
         - all
@@ -91,7 +92,7 @@ jobs:
                 matrix.bit = ["32","64","64-v2","64-v3","aarch64"];
                 break;
               default:
-                matrix.bit = ["64","64-v2","64-v3","aarch64"];
+                matrix.bit = ["64-v2"];
                 break;
             }
             core.setOutput("matrix",JSON.stringify(matrix));

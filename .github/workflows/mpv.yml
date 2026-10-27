@@ -12,7 +12,7 @@ on:
       build_target:
         description: "Build target"
         required: false
-        default: "all-64bit"
+        default: "64bit-v2"
         type: choice
         options:
         - 32bit
@@ -29,6 +29,7 @@ on:
         type: choice
         options:
         - gpl
+        - gpl-shared
         - lgpl
         - lgpl-shared
         - all
@@ -109,13 +110,13 @@ jobs:
                 matrix.bit = ["32","64","64-v2","64-v3","aarch64"];
                 break;
               default:
-                matrix.bit = ["64","64-v2","64-v3","aarch64"];
+                matrix.bit = ["64-v2"];
                 break;
             }
             core.setOutput("matrix_bit",JSON.stringify(matrix));
             const variant = "${{ inputs.variant }}" || "gpl";
             matrix.variant = variant === "all"
-              ? ["gpl", "lgpl", "lgpl-shared"]
+              ? ["gpl", "gpl-shared", "lgpl", "lgpl-shared"]
               : [variant];
             core.setOutput("matrix",JSON.stringify(matrix));
 
@@ -212,6 +213,8 @@ jobs:
           echo "sha=${{ needs.params.outputs.sha }}" >> $GITHUB_ENV
           echo "short_time=$(date "+%Y-%m-%d")" >> $GITHUB_ENV
           echo "cache_suffix=$(date "+%Y-%m-%d")-${{ github.run_id }}-${{ github.run_attempt }}" >> $GITHUB_ENV
+          # A changed recipe must never restore an installed dependency tree from another profile revision.
+          echo "profile_revision=${{ hashFiles('*.patch', 'patch/*.patch', 'mpv-patches/*.patch', 'build.sh', 'scripts/check-profile.py', '.github/workflows/mpv.yml') }}" >> $GITHUB_ENV
           sed -i '/ccache_conf.in/d'  mpv-winbuild-cmake/CMakeLists.txt
           sed -i '/ccache/d' mpv-winbuild-cmake/exec.in
 
@@ -232,9 +235,9 @@ jobs:
         uses: actions/cache/restore@v6.1.0
         with:
           path: ${{ github.workspace }}/mpv-winbuild-cmake/build${{ matrix.bit }}
-          key: ${{ inputs.compiler }}-build${{ matrix.bit }}_${{ matrix.variant }}_${{ env.cache_suffix }}
+          key: ${{ inputs.compiler }}-build${{ matrix.bit }}_${{ matrix.variant }}_${{ env.profile_revision }}_${{ env.cache_suffix }}
           restore-keys: |
-            ${{ inputs.compiler }}-build${{ matrix.bit }}_${{ matrix.variant }}_
+            ${{ inputs.compiler }}-build${{ matrix.bit }}_${{ matrix.variant }}_${{ env.profile_revision }}_
           lookup-only: true
           
       - name: Generate cache key
@@ -244,7 +247,7 @@ jobs:
           script: |
             let toolchain_restore_key="${{ steps.lookup_toolchain.outputs.cache-matched-key }}";
             let build_restore_key="${{ steps.lookup_build.outputs.cache-matched-key }}";
-            let build_save_key="${{ inputs.compiler }}-build${{ matrix.bit }}_${{ matrix.variant }}_${{ env.cache_suffix }}";
+            let build_save_key="${{ inputs.compiler }}-build${{ matrix.bit }}_${{ matrix.variant }}_${{ env.profile_revision }}_${{ env.cache_suffix }}";
             let key_suffix= "${{ env.cache_suffix }}"
             let restore_suffix= ""; // if only want to match primaryKey, set a value which make restore-keys can't hit
             
@@ -315,7 +318,7 @@ jobs:
           install_ccache: false
           restore_cache: ${{ inputs.needclean != true }}
           store_cache: ${{ inputs.no_save_cache != true }}
-          override_cache_key: ccache-build${{ matrix.bit }}-${{ inputs.compiler }}-${{ matrix.variant }}
+          override_cache_key: ccache-build${{ matrix.bit }}-${{ inputs.compiler }}-${{ matrix.variant }}-${{ env.profile_revision }}
           ccache_options: |
             cache_dir=${{ github.workspace }}/.ccache
             max_size=500M
@@ -410,27 +413,38 @@ jobs:
         id: build
         shell: bash
         run: |
+          set -euo pipefail
           chmod +x build.sh
           cd mpv-winbuild-cmake
-          # The Prepare step edits CMakeLists.txt and exec.in in place (the ccache tweaks) without
-          # committing. git am refuses to apply over a dirty tree, and any patch touching one of those
-          # files - e.g. the x86-64 microarchitecture-level patch, which edits CMakeLists.txt - aborts
-          # with "Your local changes would be overwritten by merge". Fold the edits into a commit first.
-          git commit -am "ci: fold in-place workflow edits" || true
-          if [[ "$(ls -A ../patch/*.patch)" ]]; then
-            for patch in ../patch/*.patch ; do
-              git am --3way "$patch" || git am --abort
-            done
+          # Prepare and native-patch registration edit tracked files before git am.
+          if ! git diff --quiet; then
+            git commit -am "ci: fold in-place workflow edits"
           fi
-          if [ "${{ matrix.variant }}" != "gpl" ]; then
-            git am --3way ../compile-lgpl-libmpv.patch
+          apply-required-patch() {
+            if ! git am --3way "$1"; then
+              git am --abort
+              return 1
+            fi
+          }
+          shopt -s nullglob
+          for patch in ../patch/*.patch; do
+            apply-required-patch "$patch"
+          done
+          apply-required-patch ../update-openssl.patch
+          apply-required-patch ../fix-ffmpeg-opengl.patch
+          apply-required-patch ../compile-library-mpv.patch
+          variant='${{ matrix.variant }}'
+          if [[ "$variant" == lgpl* ]]; then
+            apply-required-patch ../compile-lgpl-libmpv.patch
           fi
-          if [ "${{ matrix.variant }}" = "lgpl-shared" ]; then
-            git am --3way ../build-shared-ffmpeg.patch
+          if [[ "$variant" == *-shared ]]; then
+            apply-required-patch ../build-shared-ffmpeg.patch
           fi
-          git am --3way ../update-openssl.patch
-          git am --3way ../fix-ffmpeg-opengl.patch
-          bash ../build.sh -t '${{ matrix.bit }}' -c '${{ inputs.compiler }}' -s "${{ matrix.variant != 'gpl' && 'true' || 'false' }}"
+          suffix="-$variant"
+          if [[ "$variant" == gpl ]]; then suffix=""; fi
+          python ../scripts/check-profile.py . "$variant"
+          bash ../build.sh -t '${{ matrix.bit }}' -c '${{ inputs.compiler }}' -s true -e "-DMPV_PACKAGE_SUFFIX=$suffix"
+          python ../scripts/check-profile.py . "$variant" --build-dir "build${{ matrix.bit }}"
       - name: Collect logs
         if: ${{ always() }}
         run: |
@@ -472,6 +486,9 @@ jobs:
             for (let type of types) {
               const globber = await glob.create(`mpv-winbuild-cmake/release/${type}${suffix}-${arch}-*.7z`);
               const files = await globber.glob();
+              if (type === "mpv-dev" && files.length !== 1) {
+                throw new Error(`Expected one ${type}${suffix}-${arch} library package, found ${files.length}`);
+              }
               if ( files.length > 0 ) {
                 const file = files[0];
                 core.exportVariable( `${type}_path`, file );
@@ -491,7 +508,7 @@ jobs:
 
             const ffmpeg_dir = path.dirname(ffmpeg_path);
             const archive_files = [path.basename(ffmpeg_path)];
-            if (${{ matrix.variant == 'lgpl-shared' }}) {
+            if (${{ endsWith(matrix.variant, '-shared') }}) {
               const dll_patterns = [
                 "avcodec-*.dll", "avdevice-*.dll", "avfilter-*.dll", "avformat-*.dll",
                 "avutil-*.dll", "postproc-*.dll", "swresample-*.dll", "swscale-*.dll",
@@ -502,6 +519,12 @@ jobs:
               const dll_paths = await dll_globber.glob();
               if (dll_paths.length === 0) {
                 throw new Error(`No shared FFmpeg libraries were found beside ${ffmpeg_path}`);
+              }
+              for (const library of ["avcodec", "avdevice", "avfilter", "avformat", "avutil", "swresample", "swscale"]) {
+                const pattern = new RegExp(`^(?:lib)?${library}-[0-9]+\\.dll$`);
+                if (!dll_paths.some(file => pattern.test(path.basename(file)))) {
+                  throw new Error(`Missing shared FFmpeg library: ${library}`);
+                }
               }
               archive_files.push(...dll_paths.map(file => path.basename(file)));
             }

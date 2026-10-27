@@ -1,13 +1,14 @@
-From 4b270b1548c52329d27c06d47d46d30924ec3e96 Mon Sep 17 00:00:00 2001
-From: zhongfly <11155705+zhongfly@users.noreply.github.com>
-Date: Mon, 7 Sep 2026 03:10:40 +0300
-Subject: [PATCH] packages: add shared FFmpeg LGPL variant
+From 96f2960a802abd34eb306fced4e403afdaba7305 Mon Sep 17 00:00:00 2001
+From: diamondStar35 <ramymaherali55@gmail.com>
+Date: Tue, 27 Oct 2026 13:25:07 +0300
+Subject: [PATCH] packages: share FFmpeg linkage without changing the licence
+ profile
 
 ---
  cmake/copy_ffmpeg_dlls.cmake | 44 ++++++++++++++++++++++++++++++++++++
  packages/ffmpeg.cmake        | 12 ++++++++++
- packages/mpv.cmake           |  9 ++++++--
- 3 files changed, 63 insertions(+), 2 deletions(-)
+ packages/mpv.cmake           |  5 ++++
+ 3 files changed, 61 insertions(+)
  create mode 100644 cmake/copy_ffmpeg_dlls.cmake
 
 diff --git a/cmake/copy_ffmpeg_dlls.cmake b/cmake/copy_ffmpeg_dlls.cmake
@@ -61,23 +62,23 @@ index 0000000..8c03ecc
 +list(LENGTH _ffmpeg_dlls _ffmpeg_dlls_count)
 +message(STATUS "Copied ${_ffmpeg_dlls_count} FFmpeg DLL(s) to: ${DEST_DIR}")
 diff --git a/packages/ffmpeg.cmake b/packages/ffmpeg.cmake
-index c7a96f2..8980474 100644
+index ec2d5a4..2558e56 100644
 --- a/packages/ffmpeg.cmake
 +++ b/packages/ffmpeg.cmake
-@@ -44,6 +44,9 @@ ExternalProject_Add(ffmpeg
+@@ -49,6 +49,8 @@ ExternalProject_Add(ffmpeg
          --prefix=${MINGW_INSTALL_PREFIX}
          --arch=${TARGET_CPU}
          --target-os=mingw32
 +        --enable-shared
 +        --disable-static
-+        --disable-gpl
          --pkg-config-flags=--static
          --enable-cross-compile
          --enable-runtime-cpudetect
-@@ -97,6 +100,15 @@ ExternalProject_Add(ffmpeg
+@@ -149,6 +151,16 @@ ExternalProject_Add(ffmpeg
          "--extra-libs='${ffmpeg_extra_libs}'" # -lstdc++ / -lc++ needs by libjxl and shaderc
      BUILD_COMMAND ${MAKE}
      INSTALL_COMMAND ${MAKE} install
++        # Old static archives can otherwise win over the new DLL import libraries.
 +        COMMAND ${EXEC} rm -f
 +            ${MINGW_INSTALL_PREFIX}/lib/libavcodec.a
 +            ${MINGW_INSTALL_PREFIX}/lib/libavdevice.a
@@ -91,10 +92,10 @@ index c7a96f2..8980474 100644
  )
  
 diff --git a/packages/mpv.cmake b/packages/mpv.cmake
-index a7e44de..bcde053 100644
+index eb9ae4b..4845b23 100644
 --- a/packages/mpv.cmake
 +++ b/packages/mpv.cmake
-@@ -73,6 +73,11 @@ ExternalProject_Add_Step(mpv copy-binary
+@@ -75,6 +75,11 @@ ExternalProject_Add_Step(mpv copy-binary
      DEPENDEES strip-binary
      COMMAND ${CMAKE_COMMAND} -E copy <BINARY_DIR>/libmpv-2.dll          ${CMAKE_CURRENT_BINARY_DIR}/mpv-dev/libmpv-2.dll
      COMMAND ${CMAKE_COMMAND} -E copy <BINARY_DIR>/libmpv.dll.a          ${CMAKE_CURRENT_BINARY_DIR}/mpv-dev/libmpv.dll.a
@@ -106,17 +107,6 @@ index a7e44de..bcde053 100644
      COMMAND ${CMAKE_COMMAND} -E copy <SOURCE_DIR>/include/mpv/client.h       ${CMAKE_CURRENT_BINARY_DIR}/mpv-dev/include/mpv/client.h
      COMMAND ${CMAKE_COMMAND} -E copy <SOURCE_DIR>/include/mpv/stream_cb.h    ${CMAKE_CURRENT_BINARY_DIR}/mpv-dev/include/mpv/stream_cb.h
      COMMAND ${CMAKE_COMMAND} -E copy <SOURCE_DIR>/include/mpv/render.h       ${CMAKE_CURRENT_BINARY_DIR}/mpv-dev/include/mpv/render.h
-@@ -91,8 +96,8 @@ ExternalProject_Add_Step(mpv copy-package-dir
-     DEPENDEES copy-binary
-     COMMAND chmod 755 ${RENAME}
- 
--    COMMAND mv ${CMAKE_CURRENT_BINARY_DIR}/mpv-dev ${CMAKE_BINARY_DIR}/mpv-dev-lgpl-${TARGET_CPU}${x86_64_LEVEL}-${BUILDDATE}
--    COMMAND ${RENAME} <SOURCE_DIR> ${CMAKE_BINARY_DIR}/mpv-dev-lgpl-${TARGET_CPU}${x86_64_LEVEL}-${BUILDDATE}
-+    COMMAND mv ${CMAKE_CURRENT_BINARY_DIR}/mpv-dev ${CMAKE_BINARY_DIR}/mpv-dev-lgpl-shared-${TARGET_CPU}${x86_64_LEVEL}-${BUILDDATE}
-+    COMMAND ${RENAME} <SOURCE_DIR> ${CMAKE_BINARY_DIR}/mpv-dev-lgpl-shared-${TARGET_CPU}${x86_64_LEVEL}-${BUILDDATE}
-     COMMENT "Moving mpv package folder"
-     LOG 1
- )
 -- 
 2.54.0.windows.1
 
