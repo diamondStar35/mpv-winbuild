@@ -78,8 +78,13 @@ build() {
 
     if [ "$compiler" == "gcc" ] && [ ! -f "$buildroot/build$bit/install/bin/cross-gcc" ]; then
         ninja -C $buildroot/build$bit gcc && rm -rf $buildroot/build$bit/toolchain
-    elif [ "$compiler" == "clang" ] && [ ! "$(ls -A $clang_root/bin/clang)" ]; then
-        ninja -C $buildroot/build$bit llvm && ninja -C $buildroot/build$bit llvm-clang
+    elif [ "$compiler" == "clang" ]; then
+        if [ ! -x "$clang_root/bin/clang" ]; then
+            ninja -C "$buildroot/build$bit" llvm
+        fi
+        # clang_root and build$bit/install are cached separately. A restored compiler
+        # still needs the target's MinGW headers, CRT and C++ runtime on a clean build.
+        ninja -C "$buildroot/build$bit" llvm-clang
     fi
 
     if [[ ! "$(ls -A $buildroot/install_rustup/.cargo/bin)" ]]; then
