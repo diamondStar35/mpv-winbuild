@@ -947,7 +947,7 @@ index 5b43dee..ccd7f69 100644
 +        audio_update_volume(mpctx);
  }
  
- // Update the sparse video state during playback.
+ // Clear some playback-related fields on file loading or after seeks.
 -- 
 2.54.0.windows.1
 
