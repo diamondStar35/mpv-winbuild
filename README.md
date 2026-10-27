@@ -10,6 +10,10 @@ Based on <https://github.com/shinchiro/mpv-winbuild-cmake>.
 
 ## Manual builds
 
+For incremental builds on Windows with WSL, see
+[`scripts/local/README.md`](scripts/local/README.md). These scripts retain local
+sources and objects for MPV experiments without changing the GitHub workflow.
+
 Open **Actions**, select the **MPV** workflow, then select **Run workflow**. The default
 CPU target is `64bit-v2`; baseline x64, V3, 32-bit and ARM64 remain selectable.
 Every variant builds a shared **libmpv** client library, without the standalone
