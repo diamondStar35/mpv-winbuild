@@ -214,7 +214,7 @@ jobs:
           echo "short_time=$(date "+%Y-%m-%d")" >> $GITHUB_ENV
           echo "cache_suffix=$(date "+%Y-%m-%d")-${{ github.run_id }}-${{ github.run_attempt }}" >> $GITHUB_ENV
           # A changed recipe must never restore an installed dependency tree from another profile revision.
-          echo "profile_revision=${{ hashFiles('*.patch', 'patch/*.patch', 'mpv-patches/*.patch', 'build.sh', 'scripts/check-profile.py', '.github/workflows/mpv.yml') }}" >> $GITHUB_ENV
+          echo "profile_revision=${{ hashFiles('*.patch', 'patch/*.patch', 'mpv-patches/*.patch', 'ffmpeg-patches/*.patch', 'build.sh', 'scripts/check-profile.py', '.github/workflows/mpv.yml') }}" >> $GITHUB_ENV
           sed -i '/ccache_conf.in/d'  mpv-winbuild-cmake/CMakeLists.txt
           sed -i '/ccache/d' mpv-winbuild-cmake/exec.in
 
@@ -358,6 +358,7 @@ jobs:
         run: |
           set -euo pipefail
           cp mpv-patches/mpv-*.patch mpv-winbuild-cmake/packages/
+          cp ffmpeg-patches/ffmpeg-*.patch mpv-winbuild-cmake/packages/
           cd mpv-winbuild-cmake
           # The optional PR step may already have enabled source patches. These patches are required
           # for every variant, even when no upstream pull requests were selected.
@@ -440,6 +441,7 @@ jobs:
           if [[ "$variant" == *-shared ]]; then
             apply-required-patch ../build-shared-ffmpeg.patch
           fi
+          apply-required-patch ../enable-ffmpeg-source-patches.patch
           suffix="-$variant"
           if [[ "$variant" == gpl ]]; then suffix=""; fi
           python ../scripts/check-profile.py . "$variant"

@@ -85,6 +85,26 @@ Clients adopting script-free binaries should treat `osc=false` and
 `MPV_ERROR_OPTION_NOT_FOUND` for explicitly optional settings; keep other errors
 strict. Candidate artifacts need subsequent playback, export and disc testing.
 
+## SOFA spatialization
+
+Every build variant applies `ffmpeg-patches/` to FFmpeg before configuration.
+The recipe hook is installed by `enable-ffmpeg-source-patches.patch`. A patch
+conflict stops the build, and changes to the source patches invalidate the
+installed-library cache.
+
+The SOFAlizer patch adds runtime `rotation` and `elevation` commands. An existing
+filter retains its SOFA dataset, direction lookup, FFT plans, and audio history;
+angle changes prepare only the selected responses. Updates crossfade over 10 ms,
+and a newer pending direction replaces an older pending request. The existing
+`interpolate=1` option continues to interpolate between measured directions.
+Both +90 and -90 degrees are valid elevations and no longer wrap to zero.
+
+For an mpv audio filter labelled `audiosofa` containing a SOFAlizer instance,
+send `af-command audiosofa rotation -45 sofalizer` or
+`af-command audiosofa elevation 90 sofalizer`. Clients must send these commands
+to the existing filter to benefit from runtime updates. Replacing the filter
+still reloads the dataset, and the first initialization still prepares the file.
+
 ## Output-mixer fading
 
 Every build variant applies the patches in `mpv-patches/` to mpv before

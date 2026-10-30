@@ -19,9 +19,12 @@ def main():
     patches = [repo / 'patch_pr/0000-mpv-add-patch.patch',
                *sorted((repo / 'patch').glob('*.patch')),
                repo / 'update-openssl.patch', repo / 'fix-ffmpeg-opengl.patch',
-               repo / 'compile-library-mpv.patch', repo / 'build-shared-ffmpeg.patch']
+               repo / 'compile-library-mpv.patch', repo / 'build-shared-ffmpeg.patch',
+               repo / 'enable-ffmpeg-source-patches.patch']
+    native_patches = [*sorted((repo / 'mpv-patches').glob('mpv-*.patch')),
+                      *sorted((repo / 'ffmpeg-patches').glob('ffmpeg-*.patch'))]
     fingerprint = hashlib.sha256()
-    for path in [*patches, repo / 'scripts/check-profile.py', Path(__file__)]:
+    for path in [*patches, *native_patches, repo / 'scripts/check-profile.py', Path(__file__)]:
         fingerprint.update(path.name.encode())
         fingerprint.update(path.read_bytes().replace(b'\r\n', b'\n'))
     signature = fingerprint.hexdigest()
@@ -49,7 +52,7 @@ def main():
     run('git', 'commit', '-am', 'build: prepare local patch registration', cwd=recipe)
     for patch in patches[1:]:
         run('git', 'am', '--3way', str(staged / patch.name), cwd=recipe)
-    for patch in sorted((repo / 'mpv-patches').glob('mpv-*.patch')):
+    for patch in native_patches:
         (recipe / 'packages' / patch.name).write_text(patch.read_text(encoding='utf-8'), encoding='utf-8')
     run(sys.executable, str(repo / 'scripts/check-profile.py'), str(recipe), 'gpl-shared')
 
@@ -104,7 +107,7 @@ file(APPEND "${CMAKE_BINARY_DIR}/local-paths.sh" "ffmpeg_source='${SOURCE_DIR}'\
                                  'profile': 'gpl-shared', 'cpu': 'x86-64-v2',
                                  'mpv_lto': False, 'mpv_upstream': upstream_mpv,
                                  'native_patches': {p.name: hashlib.sha256(p.read_bytes()).hexdigest()
-                                                    for p in sorted((recipe / 'packages').glob('mpv-*.patch'))}}, indent=2) + '\n')
+                                                    for p in native_patches}}, indent=2) + '\n')
 
 
 if __name__ == '__main__':
