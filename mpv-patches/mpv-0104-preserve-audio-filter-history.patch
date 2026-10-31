@@ -1,0 +1,384 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: diamondStar35 <ramymaherali55@gmail.com>
+Date: Sat, 31 Oct 2026 12:00:00 +0200
+Subject: [PATCH] audio: retain configured filters across seeks and decoder replacement
+
+Separate stream-history reset from filter configuration and resource lifetime.
+Preserve runtime parameters; rebuild safely for unsupported or incompatible graphs.
+---
+diff --git a/DOCS/interface-changes/audio-filter-history-reset.txt b/DOCS/interface-changes/audio-filter-history-reset.txt
+new file mode 100644
+index 0000000000..e4d4b7e4e6
+--- /dev/null
++++ b/DOCS/interface-changes/audio-filter-history-reset.txt
+@@ -0,0 +1,3 @@
++Audio lavfi graphs with reset support retain instances and runtime options on seek.
++Compatible decoder replacements retain user audio processing. The read-only
++audio-filter-history-reset property reports support for this lifecycle.
+diff --git a/DOCS/man/input.rst b/DOCS/man/input.rst
+index 1b255690f1..fb8b09eecb 100644
+--- a/DOCS/man/input.rst
++++ b/DOCS/man/input.rst
+@@ -2508,7 +2508,14 @@ Property list
+ 
+     A seek discards the queued-completion timestamp but preserves the current
+     envelope. Device recreation starts at the last requested target. Property
+-    observers update at the same frequency as ``audio-pts``.
++    observers update at the same frequency as ``audio-filter-history-reset``
++    True when this build preserves supported audio filter instances across seeks
++    and compatible reloads, resetting audio history separately. Pausing retains
++    history. Unsupported graphs and format changes rebuild safely, retaining
++    current exposed runtime options. Scheduled timeline commands are discarded
++    on discontinuities. Arbitrary command side effects are not replayed.
++
++``audio-pts``.
+ 
+ ``audio-crossfade``
+     Native cross-fade state, as a map with these sub-properties:
+diff --git a/filters/f_lavfi.c b/filters/f_lavfi.c
+index ce59f576d5..144a7383a5 100644
+--- a/filters/f_lavfi.c
++++ b/filters/f_lavfi.c
+@@ -55,6 +55,10 @@
+ #include "filter_internal.h"
+ #include "user_filters.h"
+ 
++struct saved_option {
++    char *filter, *key, *value;
++};
++
+ struct lavfi {
+     struct mp_log *log;
+     struct mp_filter *f;
+@@ -67,6 +71,9 @@ struct lavfi {
+     char **direct_filter_opts;
+ 
+     AVFilterGraph *graph;
++    struct saved_option *options;
++    int num_options;
++    bool destroying;
+     // Set to true once all inputs have been initialized, and the graph is
+     // linked.
+     bool initialized;
+@@ -78,6 +85,7 @@ struct lavfi {
+     // frames), or undo previously sent EOF (libavfilter does not accept
+     // input anymore after sending EOF, so recreate the graph to "unstuck" it).
+     bool draining_recover;
++    bool format_changed;
+ 
+     // Filter can't be put into a working state.
+     bool failed;
+@@ -131,10 +139,54 @@ struct lavfi_pad {
+     struct mp_frame in_fmt;
+ };
+ 
++// Runtime options may differ from the original graph string. Keep them across
++// format-dependent rebuilds and the fallback for filters without history reset.
++static void save_options(struct lavfi *c)
++{
++    if (!c->initialized || c->destroying)
++        return;
++    TA_FREEP(&c->options);
++    c->num_options = 0;
++    for (unsigned i = 0; i < c->graph->nb_filters; i++) {
++        AVFilterContext *f = c->graph->filters[i];
++        const AVOption *opt = NULL;
++        while (f->priv && (opt = av_opt_next(f->priv, opt))) {
++            uint8_t *value = NULL;
++            if (!(opt->flags & AV_OPT_FLAG_RUNTIME_PARAM) || opt->type == AV_OPT_TYPE_CONST)
++                continue;
++            if (av_opt_get(f->priv, opt->name, 0, &value) < 0)
++                continue;
++            struct saved_option saved = {0};
++            MP_TARRAY_APPEND(c, c->options, c->num_options, saved);
++            struct saved_option *s = &c->options[c->num_options - 1];
++            s->filter = talloc_strdup(c->options, f->name);
++            s->key = talloc_strdup(c->options, opt->name);
++            s->value = talloc_strdup(c->options, (char *)value);
++            av_free(value);
++        }
++    }
++}
++
++static bool restore_options(struct lavfi *c)
++{
++    for (int i = 0; i < c->num_options; i++) {
++        struct saved_option *s = &c->options[i];
++        AVFilterContext *f = avfilter_graph_get_filter(c->graph, s->filter);
++        if (!f)
++            continue;
++        if (avfilter_process_command(f, s->key, s->value, NULL, 0, 0) < 0) {
++            MP_ERR(c, "could not restore runtime option %s on %s\n", s->key, s->filter);
++            return false;
++        }
++    }
++    return true;
++}
++
+ // Free the libavfilter graph (not c), reset all state.
+ // Does not free pending data intentionally.
+ static void free_graph(struct lavfi *c)
+ {
++    save_options(c);
+     avfilter_graph_free(&c->graph);
+     for (int n = 0; n < c->num_all_pads; n++) {
+         struct lavfi_pad *pad = c->all_pads[n];
+@@ -148,6 +200,7 @@ static void free_graph(struct lavfi *c)
+     }
+     c->initialized = false;
+     c->draining_recover = false;
++    c->format_changed = false;
+     c->in_pts = MP_NOPTS_VALUE;
+     c->in_samples = 0;
+     c->delay = 0;
+@@ -377,6 +430,7 @@ static void read_pad_input(struct lavfi *c, struct lavfi_pad *pad)
+         if (!c->draining_recover)
+             MP_VERBOSE(c, "format change on %s\n", pad->name);
+         c->draining_recover = true;
++        c->format_changed = true;
+         if (c->initialized)
+             send_global_eof(c);
+     }
+@@ -580,6 +634,12 @@ static void init_graph(struct lavfi *c)
+             return;
+         }
+ 
++        if (!restore_options(c)) {
++            free_graph(c);
++            c->failed = true;
++            return;
++        }
++
+         // The timebase is available after configuring.
+         for (int n = 0; n < c->num_out_pads; n++) {
+             struct lavfi_pad *pad = c->out_pads[n];
+@@ -757,6 +817,8 @@ static bool read_output_pads(struct lavfi *c)
+     return progress;
+ }
+ 
++static void reset_graph(struct lavfi *c);
++
+ static void lavfi_process(struct mp_filter *f)
+ {
+     struct lavfi *c = f->priv;
+@@ -780,7 +842,10 @@ static void lavfi_process(struct mp_filter *f)
+ 
+         if (all_eof) {
+             MP_VERBOSE(c, "recovering all eof\n");
+-            free_graph(c);
++            if (c->format_changed)
++                free_graph(c);
++            else
++                reset_graph(c);
+             mp_filter_internal_mark_progress(c->f);
+         }
+     }
+@@ -789,12 +854,30 @@ static void lavfi_process(struct mp_filter *f)
+         mp_filter_internal_mark_failed(c->f);
+ }
+ 
+-static void lavfi_reset(struct mp_filter *f)
++static void reset_graph(struct lavfi *c)
+ {
+-    struct lavfi *c = f->priv;
++    if (!c->destroying && c->initialized &&
++        avfilter_graph_reset(c->graph) >= 0) {
++        MP_VERBOSE(c, "cleared audio history, retaining filter instances\n");
++        c->draining_recover = false;
++        c->in_pts = MP_NOPTS_VALUE;
++        c->in_samples = 0;
++        c->delay = 0;
++        for (int n = 0; n < c->num_all_pads; n++) {
++            c->all_pads[n]->buffer_is_eof = false;
++            c->all_pads[n]->got_eagain = false;
++            mp_tags_clear(c->all_pads[n]->metadata);
++        }
++    } else {
++        free_graph(c);
++    }
+ 
+-    free_graph(c);
++}
+ 
++static void lavfi_reset(struct mp_filter *f)
++{
++    struct lavfi *c = f->priv;
++    reset_graph(c);
+     for (int n = 0; n < c->num_in_pads; n++)
+         mp_frame_unref(&c->in_pads[n]->pending);
+ }
+@@ -803,6 +886,7 @@ static void lavfi_destroy(struct mp_filter *f)
+ {
+     struct lavfi *c = f->priv;
+ 
++    c->destroying = true;
+     lavfi_reset(f);
+     av_frame_free(&c->tmp_frame);
+ }
+diff --git a/filters/filter.c b/filters/filter.c
+index 5cecef09bd..dfee5eeba2 100644
+--- a/filters/filter.c
++++ b/filters/filter.c
+@@ -752,6 +752,13 @@ void mp_filter_free_children(struct mp_filter *f)
+         talloc_free(f->in->children[0]);
+ }
+ 
++void mp_filter_free_children_except(struct mp_filter *f, struct mp_filter *keep)
++{
++    for (int n = f->in->num_children - 1; n >= 0; n--)
++        if (f->in->children[n] != keep)
++            talloc_free(f->in->children[n]);
++}
++
+ static void filter_destructor(void *p)
+ {
+     struct mp_filter *f = p;
+diff --git a/filters/filter_internal.h b/filters/filter_internal.h
+index e2e9db9ef1..9cabef727f 100644
+--- a/filters/filter_internal.h
++++ b/filters/filter_internal.h
+@@ -52,6 +52,8 @@ void mp_filter_remove_pin(struct mp_filter *f, struct mp_pin *p);
+ // Free all filters which have f as parent. (This has nothing to do with
+ // talloc.)
+ void mp_filter_free_children(struct mp_filter *f);
++// Free file-owned children while retaining the parked user audio chain.
++void mp_filter_free_children_except(struct mp_filter *f, struct mp_filter *keep);
+ 
+ struct mp_filter_params;
+ 
+diff --git a/player/audio.c b/player/audio.c
+index 51cb189d6a..04b3f15fef 100644
+--- a/player/audio.c
++++ b/player/audio.c
+@@ -108,8 +108,11 @@ fail:
+ int reinit_audio_filters(struct MPContext *mpctx)
+ {
+     struct ao_chain *ao_c = mpctx->ao_chain;
+-    if (!ao_c)
+-        return 0;
++    if (!ao_c) {
++        return !mpctx->saved_audio_filters ||
++               mp_output_chain_update_filters(mpctx->saved_audio_filters, mpctx->opts->af_settings)
++               ? 0 : -1;
++    }
+ 
+     double delay = mp_output_get_measured_total_delay(ao_c->filter);
+ 
+@@ -489,7 +492,14 @@ static void ao_chain_uninit(struct ao_chain *ao_c)
+     if (ao_c->filter_src)
+         mp_pin_disconnect(ao_c->filter_src);
+ 
+-    talloc_free(ao_c->filter->f);
++    struct MPContext *mpctx = ao_c->mpctx;
++    // The decoder and AO adapter belong to the file, but user filters do not.
++    mp_pin_disconnect(ao_c->filter->f->pins[0]);
++    mp_pin_disconnect(ao_c->filter->f->pins[1]);
++    if (mpctx->saved_audio_filters)
++        talloc_free(mpctx->saved_audio_filters->f);
++    mpctx->saved_audio_filters = ao_c->filter;
++    mp_output_chain_reset_harder(ao_c->filter);
+     talloc_free(ao_c->ao_filter);
+     talloc_free(ao_c);
+ }
+@@ -814,8 +824,10 @@ void reinit_audio_chain_src(struct MPContext *mpctx, struct track *track)
+     mpctx->ao_chain = ao_c;
+     ao_c->mpctx = mpctx;
+     ao_c->log = mpctx->log;
+-    ao_c->filter =
+-        mp_output_chain_create(mpctx->filter_root, MP_OUTPUT_CHAIN_AUDIO);
++    ao_c->filter = mpctx->saved_audio_filters;
++    mpctx->saved_audio_filters = NULL;
++    if (!ao_c->filter)
++        ao_c->filter = mp_output_chain_create(mpctx->filter_root, MP_OUTPUT_CHAIN_AUDIO);
+     ao_c->spdif_passthrough = true;
+     ao_c->last_out_pts = MP_NOPTS_VALUE;
+     ao_c->delay = mpctx->opts->audio_delay;
+diff --git a/player/command.c b/player/command.c
+index de674d6f53..d78ebd9b4a 100644
+--- a/player/command.c
++++ b/player/command.c
+@@ -883,6 +883,12 @@ static int mp_property_audio_pts(void *ctx, struct m_property *prop,
+     return property_time(action, arg, playing_audio_pts(mpctx));
+ }
+ 
++static int mp_property_audio_history_reset(void *ctx, struct m_property *prop,
++                                           int action, void *arg)
++{
++    return m_property_bool_ro(action, arg, true);
++}
++
+ static int mp_property_audio_fade(void *ctx, struct m_property *prop,
+                                  int action, void *arg)
+ {
+@@ -4780,6 +4786,7 @@ static const struct m_property mp_properties_base[] = {
+     {"aid", mp_property_switch_track, .priv = (void *)(const int[]){0, STREAM_AUDIO}},
+     {"audio-device", mp_property_audio_device},
+     {"audio-device-list", mp_property_audio_devices},
++    {"audio-filter-history-reset", mp_property_audio_history_reset},
+     {"current-ao", mp_property_ao},
+ 
+     // Video
+diff --git a/player/core.h b/player/core.h
+index 91c80f1f53..20654f55ea 100644
+--- a/player/core.h
++++ b/player/core.h
+@@ -339,6 +339,8 @@ typedef struct MPContext {
+     struct ao *ao;
+     struct mp_aframe *ao_filter_fmt; // for weak gapless audio check
+     struct ao_chain *ao_chain;
++    // Decoder-independent user processing retained between compatible files.
++    struct mp_output_chain *saved_audio_filters;
+ 
+     // Persist the requested envelope when the audio device is recreated.
+     bool audio_fade_set;
+diff --git a/player/loadfile.c b/player/loadfile.c
+index e1257e3eba..54457a6e9d 100644
+--- a/player/loadfile.c
++++ b/player/loadfile.c
+@@ -52,6 +52,7 @@
+ #include "filters/f_decoder_wrapper.h"
+ #include "filters/f_lavfi.h"
+ #include "filters/filter_internal.h"
++#include "filters/f_output_chain.h"
+ #include "demux/demux.h"
+ #include "stream/stream.h"
+ #include "sub/dec_sub.h"
+@@ -1833,7 +1834,8 @@ static void play_current_file(struct MPContext *mpctx)
+     mpctx->last_seek_pts = 0.0;
+     mpctx->seek = (struct seek_params){ 0 };
+     disc_nav_reset(mpctx);
+-    mpctx->filter_root = mp_filter_create_root(mpctx->global);
++    if (!mpctx->filter_root)
++        mpctx->filter_root = mp_filter_create_root(mpctx->global);
+     mp_filter_graph_set_wakeup_cb(mpctx->filter_root, mp_wakeup_core_cb, mpctx);
+     mp_filter_graph_set_max_run_time(mpctx->filter_root, 0.1);
+ 
+@@ -2149,7 +2151,12 @@ terminate_playback:
+     if (!reloading)
+         m_config_restore_backups(mpctx->mconfig);
+ 
+-    TA_FREEP(&mpctx->filter_root);
++    if (mpctx->saved_audio_filters) {
++        mp_filter_free_children_except(mpctx->filter_root, mpctx->saved_audio_filters->f);
++        mp_filter_has_failed(mpctx->filter_root); // clear the outgoing stream's error latch
++    } else {
++        TA_FREEP(&mpctx->filter_root);
++    }
+     talloc_free(mpctx->filtered_tags);
+     mpctx->filtered_tags = NULL;
+ 
+diff --git a/player/main.c b/player/main.c
+index 0ef3d7f6d6..8c1b54512b 100644
+--- a/player/main.c
++++ b/player/main.c
+@@ -182,6 +182,8 @@ void mp_destroy(struct MPContext *mpctx)
+     mp_uninit_ipc(mpctx->ipc_ctx);
+     mpctx->ipc_ctx = NULL;
+ 
++    TA_FREEP(&mpctx->filter_root);
++    mpctx->saved_audio_filters = NULL;
+     uninit_audio_out(mpctx);
+     uninit_video_out(mpctx);
+ 
+-- 
+2.54.0.windows.1

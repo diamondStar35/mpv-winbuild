@@ -560,6 +560,20 @@ jobs:
           path: mpv-winbuild-cmake/release/${{ env.ffmpeg_name }}.7z
           archive: false
 
+      - name: Locate native history regression executable
+        id: history_test
+        if: ${{ matrix.bit == '64-v2' && matrix.variant == 'gpl-shared' }}
+        shell: bash
+        run: |
+          executable=$(find mpv-winbuild-cmake -path '*/native-tests/history_reset.exe' -print -quit)
+          test -n "$executable"
+          echo "path=$executable" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@v7
+        if: ${{ steps.history_test.outputs.path != '' }}
+        with:
+          name: native-history-gpl-shared-64-v2
+          path: ${{ steps.history_test.outputs.path }}
+
       - name: Save clang sysroot cache
         if: ${{ inputs.compiler =='clang' && inputs.no_save_cache != true && (inputs.variant != 'all' || matrix.variant == 'gpl') }}
         uses: actions/cache/save@v6.1.0
@@ -823,6 +837,41 @@ jobs:
         run: |
           git checkout main
           bash prunetags.sh
+
+  filter_history_tests:
+    name: Test audio filter history
+    needs: build_mpv
+    if: ${{ contains(fromJSON('["64bit-v2","all-64bit","all"]'), inputs.build_target) && contains(fromJSON('["gpl-shared","all"]'), inputs.variant) }}
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.13'
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: ffmpeg-gpl-shared-x86_64-v2-*
+          path: native-artifacts
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: mpv-dev-gpl-shared-x86_64-v2-*
+          path: native-artifacts
+      - uses: actions/download-artifact@v8
+        with:
+          name: native-history-gpl-shared-64-v2
+          path: native-tests
+      - name: Run native history regression tests
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path native-libraries -Force | Out-Null
+          Get-ChildItem native-artifacts -Recurse -Filter *.7z | ForEach-Object {
+            & 7z x $_.FullName '-onative-extracted' -y | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw 'Could not extract native libraries.' }
+          }
+          Get-ChildItem native-extracted -Recurse -Filter *.dll | Copy-Item -Destination native-libraries
+          Get-ChildItem native-tests -Recurse -Filter history_reset.exe | Copy-Item -Destination native-libraries
+          python scripts/tests/filter_history.py native-libraries
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
   cache:
     name: keep cache alive

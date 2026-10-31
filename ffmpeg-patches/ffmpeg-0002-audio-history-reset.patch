@@ -1,0 +1,615 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: diamondStar35 <ramymaherali55@gmail.com>
+Date: Sat, 31 Oct 2026 12:00:00 +0200
+Subject: [PATCH] avfilter: reset audio history without discarding configured filters
+
+Separate stream-history reset from filter configuration and resource lifetime.
+Preserve runtime parameters; rebuild safely for unsupported or incompatible graphs.
+---
+diff --git a/libavfilter/Makefile b/libavfilter/Makefile
+index e00652e..71c6fa9 100644
+--- a/libavfilter/Makefile
++++ b/libavfilter/Makefile
+@@ -687,7 +687,7 @@ SKIPHEADERS-$(CONFIG_VULKAN)                 += vulkan_filter.h
+ SKIPHEADERS-$(CONFIG_SCALE_CUDA_FILTER)      += vf_scale_cuda.h
+ 
+ TOOLS     = graph2dot
+-TESTPROGS = drawutils filtfmts formats integral
++TESTPROGS = drawutils filtfmts formats integral history_reset
+ 
+ TESTPROGS-$(CONFIG_DRAWVG_FILTER) += drawvg
+ 
+@@ -702,3 +702,11 @@ OPENCL = $(subst $(SRC_PATH)/,,$(wildcard $(SRC_PATH)/libavfilter/opencl/*.cl))
+ libavfilter/opencl/%.c: TAG = OPENCL
+ libavfilter/opencl/%.c: $(SRC_PATH)/libavfilter/opencl/%.cl
+ 	$(M)$(SRC_PATH)/tools/source2c $< $@
++
++# Ship regression executables separately from the player/runtime package.
++all: libavfilter/tests/history_reset$(EXESUF)
++install: install-history-reset-test
++.PHONY: install-history-reset-test
++install-history-reset-test: libavfilter/tests/history_reset$(EXESUF)
++	$(Q)mkdir -p "$(DESTDIR)$(prefix)/native-tests"
++	$(Q)cp $< "$(DESTDIR)$(prefix)/native-tests/"
+diff --git a/libavfilter/af_aformat.c b/libavfilter/af_aformat.c
+index ce54e04..18dfa45 100644
+--- a/libavfilter/af_aformat.c
++++ b/libavfilter/af_aformat.c
+@@ -132,7 +132,14 @@ static int query_formats(const AVFilterContext *ctx,
+     return 0;
+ }
+ 
++static int reset_history(AVFilterContext *ctx)
++{
++    /* Format restrictions have no stream history. */
++    return 0;
++}
++
+ const FFFilter ff_af_aformat = {
++    .reset         = reset_history,
+     .p.name        = "aformat",
+     .p.description = NULL_IF_CONFIG_SMALL("Convert the input audio to one of the specified formats."),
+     .p.priv_class  = &aformat_class,
+diff --git a/libavfilter/af_alimiter.c b/libavfilter/af_alimiter.c
+index 786f210..8af2651 100644
+--- a/libavfilter/af_alimiter.c
++++ b/libavfilter/af_alimiter.c
+@@ -403,6 +403,24 @@ static av_cold void uninit(AVFilterContext *ctx)
+     av_fifo_freep2(&s->fifo);
+ }
+ 
++static int reset_history(AVFilterContext *ctx)
++{
++    AudioLimiterContext *s = ctx->priv;
++    const int channels = ctx->inputs[0]->ch_layout.nb_channels;
++    const int size = ctx->inputs[0]->sample_rate * (int64_t)channels / 10 + channels;
++    memset(s->buffer, 0, size * sizeof(*s->buffer));
++    memset(s->nextdelta, 0, size * sizeof(*s->nextdelta));
++    memset(s->nextpos, -1, size * sizeof(*s->nextpos));
++    av_fifo_reset2(s->fifo);
++    s->att = 1.;
++    s->asc = s->delta = 0.;
++    s->asc_pos = -1;
++    s->asc_c = s->asc_changed = s->pos = s->nextiter = s->nextlen = 0;
++    s->in_trim = s->out_pad = s->latency ? s->buffer_size / channels - 1 : 0;
++    s->next_in_pts = s->next_out_pts = AV_NOPTS_VALUE;
++    return 0;
++}
++
+ static const AVFilterPad alimiter_inputs[] = {
+     {
+         .name         = "main",
+@@ -421,6 +439,7 @@ static const AVFilterPad alimiter_outputs[] = {
+ };
+ 
+ const FFFilter ff_af_alimiter = {
++    .reset         = reset_history,
+     .p.name         = "alimiter",
+     .p.description  = NULL_IF_CONFIG_SMALL("Audio lookahead limiter."),
+     .p.priv_class   = &alimiter_class,
+diff --git a/libavfilter/af_aresample.c b/libavfilter/af_aresample.c
+index 8e7f5bf..2914138 100644
+--- a/libavfilter/af_aresample.c
++++ b/libavfilter/af_aresample.c
+@@ -425,6 +425,16 @@ static const AVClass aresample_class = {
+     .child_next       = resample_child_next,
+ };
+ 
++static int reset_history(AVFilterContext *ctx)
++{
++    AResampleContext *s = ctx->priv;
++    swr_close(s->swr);
++    s->next_pts = AV_NOPTS_VALUE;
++    s->more_data = 0;
++    return swr_init(s->swr);
++    return 0;
++}
++
+ static const AVFilterPad aresample_outputs[] = {
+     {
+         .name          = "default",
+@@ -434,6 +444,7 @@ static const AVFilterPad aresample_outputs[] = {
+ };
+ 
+ const FFFilter ff_af_aresample = {
++    .reset         = reset_history,
+     .p.name        = "aresample",
+     .p.description = NULL_IF_CONFIG_SMALL("Resample audio data."),
+     .p.priv_class  = &aresample_class,
+diff --git a/libavfilter/af_biquads.c b/libavfilter/af_biquads.c
+index 19a6c63..ec2a51d 100644
+--- a/libavfilter/af_biquads.c
++++ b/libavfilter/af_biquads.c
+@@ -1447,6 +1447,22 @@ static const AVFilterPad outputs[] = {
+ #define FLAGS AV_OPT_FLAG_AUDIO_PARAM|AV_OPT_FLAG_FILTERING_PARAM|AV_OPT_FLAG_RUNTIME_PARAM
+ #define AF AV_OPT_FLAG_AUDIO_PARAM|AV_OPT_FLAG_FILTERING_PARAM
+ 
++static int reset_history(AVFilterContext *ctx)
++{
++    BiquadsContext *s = ctx->priv;
++    AVFrame *frames[] = { s->cache[0], s->cache[1], s->block[0], s->block[1], s->block[2] };
++    for (unsigned i = 0; i < FF_ARRAY_ELEMS(frames); i++) {
++        AVFrame *f = frames[i];
++        if (f)
++            av_samples_set_silence(f->extended_data, 0, f->nb_samples,
++                                   f->ch_layout.nb_channels, f->format);
++    }
++    memset(s->clip, 0, ctx->inputs[0]->ch_layout.nb_channels * sizeof(*s->clip));
++    s->pts = AV_NOPTS_VALUE;
++    s->nb_samples = 0;
++    return 0;
++}
++
+ #define DEFINE_BIQUAD_FILTER_2(name_, description_, priv_class_)        \
+ static av_cold int name_##_init(AVFilterContext *ctx)                   \
+ {                                                                       \
+@@ -1465,6 +1481,7 @@ const FFFilter ff_af_##name_ = {                         \
+     .priv_size     = sizeof(BiquadsContext),             \
+     .init          = name_##_init,                       \
+     .activate      = activate,                           \
++    .reset         = reset_history, \
+     .uninit        = uninit,                             \
+     FILTER_INPUTS(ff_audio_default_filterpad),           \
+     FILTER_OUTPUTS(outputs),                             \
+diff --git a/libavfilter/af_dynaudnorm.c b/libavfilter/af_dynaudnorm.c
+index 98a3bb9..858f3a4 100644
+--- a/libavfilter/af_dynaudnorm.c
++++ b/libavfilter/af_dynaudnorm.c
+@@ -1026,6 +1026,28 @@ static int process_command(AVFilterContext *ctx, const char *cmd, const char *ar
+     return 0;
+ }
+ 
++static int reset_history(AVFilterContext *ctx)
++{
++    DynamicAudioNormalizerContext *s = ctx->priv;
++    ff_bufqueue_discard_all(&s->queue);
++    s->eof = 0;
++    s->pts = AV_NOPTS_VALUE;
++    s->var_values[VAR_T] = NAN;
++    s->var_values[VAR_SN] = 0;
++    for (int c = 0; c < s->channels; c++) {
++        cqueue *queues[] = { s->gain_history_original[c], s->gain_history_minimum[c],
++                            s->gain_history_smoothed[c], s->threshold_history[c] };
++        s->prev_amplification_factor[c] = 1.;
++        s->dc_correction_value[c] = s->compress_threshold[c] = 0.;
++        for (unsigned i = 0; i < FF_ARRAY_ELEMS(queues); i++)
++            queues[i]->nb_elements = 0;
++    }
++    s->is_enabled->nb_elements = 0;
++    av_samples_set_silence(s->window->extended_data, 0, s->window->nb_samples,
++                           s->window->ch_layout.nb_channels, s->window->format);
++    return 0;
++}
++
+ static const AVFilterPad avfilter_af_dynaudnorm_inputs[] = {
+     {
+         .name           = "default",
+@@ -1035,6 +1057,7 @@ static const AVFilterPad avfilter_af_dynaudnorm_inputs[] = {
+ };
+ 
+ const FFFilter ff_af_dynaudnorm = {
++    .reset         = reset_history,
+     .p.name        = "dynaudnorm",
+     .p.description = NULL_IF_CONFIG_SMALL("Dynamic Audio Normalizer."),
+     .p.priv_class  = &dynaudnorm_class,
+diff --git a/libavfilter/af_silenceremove.c b/libavfilter/af_silenceremove.c
+index fe12fd5..968b255 100644
+--- a/libavfilter/af_silenceremove.c
++++ b/libavfilter/af_silenceremove.c
+@@ -462,6 +462,25 @@ static av_cold void uninit(AVFilterContext *ctx)
+     av_freep(&s->stop_back);
+ }
+ 
++static int reset_history(AVFilterContext *ctx)
++{
++    SilenceRemoveContext *s = ctx->priv;
++    const int channels = ctx->inputs[0]->ch_layout.nb_channels;
++    clear_windows(s);
++    memset(s->start_cache, 0, channels * s->cache_size * sizeof(*s->start_cache));
++    memset(s->stop_cache, 0, channels * s->cache_size * sizeof(*s->stop_cache));
++    memset(s->start_front, 0, channels * sizeof(*s->start_front));
++    memset(s->start_back, 0, channels * sizeof(*s->start_back));
++    memset(s->stop_front, 0, channels * sizeof(*s->stop_front));
++    memset(s->stop_back, 0, channels * sizeof(*s->stop_back));
++    s->start_found_periods = s->stop_found_periods = 0;
++    s->start_sample_count = s->start_silence_count = 0;
++    s->stop_sample_count = s->stop_silence_count = 0;
++    s->found_nonsilence = 0;
++    s->next_pts = AV_NOPTS_VALUE;
++    return 0;
++}
++
+ static const AVFilterPad silenceremove_inputs[] = {
+     {
+         .name         = "default",
+@@ -479,6 +498,7 @@ static const AVFilterPad silenceremove_outputs[] = {
+ };
+ 
+ const FFFilter ff_af_silenceremove = {
++    .reset         = reset_history,
+     .p.name        = "silenceremove",
+     .p.description = NULL_IF_CONFIG_SMALL("Remove silence."),
+     .p.priv_class  = &silenceremove_class,
+diff --git a/libavfilter/af_sofalizer.c b/libavfilter/af_sofalizer.c
+index 62d5e90..a0287c6 100644
+--- a/libavfilter/af_sofalizer.c
++++ b/libavfilter/af_sofalizer.c
+@@ -940,6 +940,23 @@ static const AVOption sofalizer_options[] = {
+ 
+ AVFILTER_DEFINE_CLASS(sofalizer);
+ 
++static int reset_history(AVFilterContext *ctx)
++{
++    SOFAlizerContext *s = ctx->priv;
++    if (s->pending_ready) {
++        int spare = s->current;
++        s->current = s->pending;
++        s->pending = spare;
++        s->pending_ready = 0;
++    }
++    s->transition_pos = s->transition_samples;
++    for (int ear = 0; ear < 2; ear++) {
++        memset(s->ringbuffer[ear], 0, (size_t)s->n_conv * s->buffer_length * sizeof(float));
++        s->write[ear] = 0;
++    }
++    return 0;
++}
++
+ static const AVFilterPad inputs[] = {
+     {
+         .name         = "default",
+@@ -949,6 +966,7 @@ static const AVFilterPad inputs[] = {
+ };
+ 
+ const FFFilter ff_af_sofalizer = {
++    .reset         = reset_history,
+     .p.name        = "sofalizer",
+     .p.description = NULL_IF_CONFIG_SMALL("SOFAlizer (Spatially Oriented Format for Acoustics)."),
+     .p.priv_class  = &sofalizer_class,
+diff --git a/libavfilter/af_stereotools.c b/libavfilter/af_stereotools.c
+index b18f6e6..8dbc233 100644
+--- a/libavfilter/af_stereotools.c
++++ b/libavfilter/af_stereotools.c
+@@ -370,6 +370,14 @@ static av_cold void uninit(AVFilterContext *ctx)
+     av_freep(&s->buffer);
+ }
+ 
++static int reset_history(AVFilterContext *ctx)
++{
++    StereoToolsContext *s = ctx->priv;
++    memset(s->buffer, 0, s->length * sizeof(*s->buffer));
++    s->pos = 0;
++    return 0;
++}
++
+ static const AVFilterPad inputs[] = {
+     {
+         .name         = "default",
+@@ -380,6 +388,7 @@ static const AVFilterPad inputs[] = {
+ };
+ 
+ const FFFilter ff_af_stereotools = {
++    .reset         = reset_history,
+     .p.name         = "stereotools",
+     .p.description  = NULL_IF_CONFIG_SMALL("Apply various stereo tools."),
+     .p.priv_class   = &stereotools_class,
+diff --git a/libavfilter/avfilter.h b/libavfilter/avfilter.h
+index a6b875c..7146589 100644
+--- a/libavfilter/avfilter.h
++++ b/libavfilter/avfilter.h
+@@ -1198,6 +1198,15 @@ char *avfilter_graph_dump(AVFilterGraph *graph, const char *options);
+  */
+ int avfilter_graph_request_oldest(AVFilterGraph *graph);
+ 
++/**
++ * Discard queued audio, EOF and stream history while retaining configured filters.
++ * The caller must serialize this with all graph operations. Unsupported graphs
++ * return AVERROR(ENOSYS) without mutation. Other errors leave the graph unusable
++ * until rebuilt. Scheduled commands belong to the old timeline and are removed;
++ * current options and negotiated link properties are preserved.
++ */
++int avfilter_graph_reset(AVFilterGraph *graph);
++
+ /**
+  * @}
+  */
+diff --git a/libavfilter/avfiltergraph.c b/libavfilter/avfiltergraph.c
+index 7d089ad..ef980bd 100644
+--- a/libavfilter/avfiltergraph.c
++++ b/libavfilter/avfiltergraph.c
+@@ -1655,3 +1655,59 @@ int ff_filter_graph_run_once(AVFilterGraph *graph)
+         return AVERROR(EAGAIN);
+     return ff_filter_activate(&ctxi->p);
+ }
++
++int avfilter_graph_reset(AVFilterGraph *graph)
++{
++    FFFilterGraph *g = fffiltergraph(graph);
++    int ret;
++
++    if (!graph || !graph->nb_filters)
++        return AVERROR(EINVAL);
++    /* Preflight every node before changing any state, including auto converters. */
++    for (unsigned i = 0; i < graph->nb_filters; i++) {
++        AVFilterContext *ctx = graph->filters[i];
++        if (!fffilter(ctx->filter)->reset)
++            return AVERROR(ENOSYS);
++        for (unsigned j = 0; j < ctx->nb_outputs; j++)
++            if (!ctx->outputs[j] || ff_link_internal(ctx->outputs[j])->init_state != AVLINK_INIT ||
++                ctx->outputs[j]->type != AVMEDIA_TYPE_AUDIO)
++                return AVERROR(ENOSYS);
++    }
++    for (unsigned i = 0; i < graph->nb_filters; i++) {
++        AVFilterContext *ctx = graph->filters[i];
++        FFFilterContext *fc = fffilterctx(ctx);
++        fc->ready = 0;
++        while (fc->command_queue) {
++            AVFilterCommand *cmd = fc->command_queue;
++            fc->command_queue = cmd->next;
++            av_free(cmd->command);
++            av_free(cmd->arg);
++            av_free(cmd);
++        }
++        for (unsigned j = 0; j < ctx->nb_outputs; j++) {
++            AVFilterLink *link = ctx->outputs[j];
++            FilterLinkInternal *li = ff_link_internal(link);
++            FFFrameQueue *q = &li->fifo;
++            while (q->queued) {
++                AVFrame *frame = ff_framequeue_take(q);
++                av_frame_free(&frame);
++            }
++            q->total_frames_head = q->total_frames_tail = 0;
++            q->total_samples_head = q->total_samples_tail = 0;
++            q->samples_skipped = 0;
++            li->status_in = li->status_out = 0;
++            li->status_in_pts = AV_NOPTS_VALUE;
++            li->frame_blocked_in = li->frame_wanted_out = 0;
++            li->l.current_pts = li->l.current_pts_us = AV_NOPTS_VALUE;
++            li->l.frame_count_in = li->l.frame_count_out = 0;
++            li->l.sample_count_in = li->l.sample_count_out = 0;
++        }
++        ret = fffilter(ctx->filter)->reset(ctx);
++        if (ret < 0)
++            return ret;
++    }
++    /* All timestamps are equal again, so the existing sink heap is valid. */
++    for (int i = 0; i < g->sink_links_count; i++)
++        g->sink_links[i]->age_index = i;
++    return 0;
++}
+diff --git a/libavfilter/buffersink.c b/libavfilter/buffersink.c
+index 97c8ea5..30f4998 100644
+--- a/libavfilter/buffersink.c
++++ b/libavfilter/buffersink.c
+@@ -413,7 +413,15 @@ static const AVFilterPad inputs_audio[] = {
+     },
+ };
+ 
++static int reset_history(AVFilterContext *ctx)
++{
++    BufferSinkContext *s = ctx->priv;
++    av_frame_free(&s->peeked_frame);
++    return 0;
++}
++
+ const FFFilter ff_asink_abuffer = {
++    .reset         = reset_history,
+     .p.name        = "abuffersink",
+     .p.description = NULL_IF_CONFIG_SMALL("Buffer audio frames, and make them available to the end of the filter graph."),
+     .p.priv_class  = &abuffersink_class,
+diff --git a/libavfilter/buffersrc.c b/libavfilter/buffersrc.c
+index 8e6097d..316b0d4 100644
+--- a/libavfilter/buffersrc.c
++++ b/libavfilter/buffersrc.c
+@@ -680,7 +680,16 @@ static const AVFilterPad avfilter_asrc_abuffer_outputs[] = {
+     },
+ };
+ 
++static int reset_history(AVFilterContext *ctx)
++{
++    BufferSourceContext *s = ctx->priv;
++    s->eof = s->nb_failed_requests = 0;
++    s->last_pts = AV_NOPTS_VALUE;
++    return 0;
++}
++
+ const FFFilter ff_asrc_abuffer = {
++    .reset         = reset_history,
+     .p.name        = "abuffer",
+     .p.description = NULL_IF_CONFIG_SMALL("Buffer audio frames, and make them accessible to the filterchain."),
+     .p.priv_class  = &abuffer_class,
+diff --git a/libavfilter/filters.h b/libavfilter/filters.h
+index 2df05a7..dc205b2 100644
+--- a/libavfilter/filters.h
++++ b/libavfilter/filters.h
+@@ -474,6 +474,12 @@ typedef struct FFFilter {
+      * activation.
+      */
+     int (*activate)(AVFilterContext *ctx);
++
++    /** Clear stream history without changing options or negotiated formats.
++     * Called with graph execution stopped. NULL means reset is unsupported.
++     * A failure requires the caller to rebuild the graph before further use.
++     */
++    int (*reset)(AVFilterContext *ctx);
+ } FFFilter;
+ 
+ static inline const FFFilter *fffilter(const AVFilter *f)
+diff --git a/libavfilter/tests/history_reset.c b/libavfilter/tests/history_reset.c
+new file mode 100644
+index 0000000..f68d400
+--- /dev/null
++++ b/libavfilter/tests/history_reset.c
+@@ -0,0 +1,157 @@
++/* Regression coverage for the history-only graph reset API. LGPL-2.1-or-later. */
++#include <errno.h>
++#include <math.h>
++#include <stdio.h>
++#include <string.h>
++#include "libavutil/channel_layout.h"
++#include "libavutil/mem.h"
++#include "libavutil/opt.h"
++#include "libavfilter/avfilter.h"
++#include "libavfilter/buffersrc.h"
++#include "libavfilter/buffersink.h"
++
++#define CHECK(x) do { if (!(x)) { fprintf(stderr, "line %d: %s\n", __LINE__, #x); return 1; } } while (0)
++
++static AVFilterGraph *create_graph(const char *filter, AVFilterContext **src, AVFilterContext **sink)
++{
++    AVFilterGraph *g = avfilter_graph_alloc();
++    AVFilterInOut *inputs = avfilter_inout_alloc(), *outputs = avfilter_inout_alloc();
++    int ret;
++    if (!g || !inputs || !outputs)
++        goto fail;
++    if (avfilter_graph_create_filter(src, avfilter_get_by_name("abuffer"), "source",
++            "sample_rate=48000:sample_fmt=fltp:channel_layout=stereo:time_base=1/48000", NULL, g) < 0 ||
++        avfilter_graph_create_filter(sink, avfilter_get_by_name("abuffersink"), "sink", NULL, NULL, g) < 0)
++        goto fail;
++    outputs->name = av_strdup("in"); outputs->filter_ctx = *src;
++    inputs->name = av_strdup("out"); inputs->filter_ctx = *sink;
++    ret = avfilter_graph_parse_ptr(g, filter, &inputs, &outputs, NULL);
++    avfilter_inout_free(&inputs); avfilter_inout_free(&outputs);
++    if (ret < 0 || avfilter_graph_config(g, NULL) < 0)
++        goto fail;
++    return g;
++fail:
++    avfilter_inout_free(&inputs); avfilter_inout_free(&outputs);
++    avfilter_graph_free(&g);
++    return NULL;
++}
++
++static int feed(AVFilterContext *src, int64_t pts, int impulse)
++{
++    AVFrame *f = av_frame_alloc();
++    int ret;
++    if (!f) return AVERROR(ENOMEM);
++    f->format = AV_SAMPLE_FMT_FLTP; f->sample_rate = 48000;
++    f->ch_layout = (AVChannelLayout)AV_CHANNEL_LAYOUT_STEREO;
++    f->nb_samples = 1024; f->pts = pts;
++    ret = av_frame_get_buffer(f, 0);
++    if (ret >= 0) {
++        av_samples_set_silence(f->extended_data, 0, f->nb_samples, 2, f->format);
++        if (impulse)
++            ((float *)f->extended_data[0])[0] = ((float *)f->extended_data[1])[0] = 0.8f;
++        ret = av_buffersrc_add_frame(src, f);
++    }
++    av_frame_free(&f);
++    return ret;
++}
++
++static int drain(AVFilterContext *sink, int silent, int *frames)
++{
++    AVFrame *f = av_frame_alloc();
++    int ret;
++    if (!f) return AVERROR(ENOMEM);
++    while ((ret = av_buffersink_get_frame(sink, f)) >= 0) {
++        (*frames)++;
++        if (f->format != AV_SAMPLE_FMT_FLTP) { ret = AVERROR_INVALIDDATA; break; }
++        if (silent) {
++            for (int c = 0; c < f->ch_layout.nb_channels; c++)
++                for (int n = 0; n < f->nb_samples; n++)
++                    if (fabsf(((float *)f->extended_data[c])[n]) > 1e-7f) {
++                        av_frame_free(&f);
++                        return AVERROR_INVALIDDATA;
++                    }
++        }
++        av_frame_unref(f);
++    }
++    av_frame_free(&f);
++    return ret == AVERROR_EOF || ret == AVERROR(EAGAIN) ? 0 : ret;
++}
++
++static int test_reset(const char *filter)
++{
++    AVFilterContext *src = NULL, *sink = NULL;
++    AVFilterGraph *g = create_graph(filter, &src, &sink);
++    AVFilterContext **identities;
++    int frames = 0;
++    CHECK(g);
++    identities = av_memdup(g->filters, g->nb_filters * sizeof(*identities));
++    CHECK(identities);
++    for (int cycle = 0; cycle < 3; cycle++) {
++        CHECK(feed(src, 0, 1) >= 0);
++        CHECK(drain(sink, 0, &frames) == 0);
++        CHECK(feed(src, 1024, 1) >= 0);
++        /* Include queued samples and an EOF which has not yet been consumed. */
++        CHECK(av_buffersrc_add_frame(src, NULL) >= 0);
++        CHECK(avfilter_graph_reset(g) == 0);
++        for (unsigned i = 0; i < g->nb_filters; i++) CHECK(g->filters[i] == identities[i]);
++        for (int i = 0; i < 160; i++) {
++            CHECK(feed(src, 480000 + i * 1024, 0) >= 0);
++            CHECK(drain(sink, 1, &frames) == 0);
++        }
++        CHECK(av_buffersrc_add_frame(src, NULL) >= 0);
++        CHECK(drain(sink, 1, &frames) == 0);
++        CHECK(avfilter_graph_reset(g) == 0);
++    }
++    CHECK(frames > 0 || strstr(filter, "silenceremove"));
++    av_free(identities);
++    avfilter_graph_free(&g);
++    return 0;
++}
++
++int main(int argc, char **argv)
++{
++    static const char *filters[] = {
++        "aformat=sample_fmts=fltp",
++        "equalizer=f=1000:t=q:w=1:g=6,aformat=sample_fmts=fltp",
++        "equalizer=f=1000:t=q:w=1:g=6:blocksize=512,aformat=sample_fmts=fltp",
++        "stereotools=delay=20,aformat=sample_fmts=fltp",
++        "alimiter=limit=0.95:latency=1,aformat=sample_fmts=fltp",
++        "dynaudnorm=f=150:g=15,aformat=sample_fmts=fltp",
++        "silenceremove=start_periods=1:start_threshold=0.01:stop_periods=-1:stop_threshold=0.01,aformat=sample_fmts=fltp",
++        "aformat=channel_layouts=mono,aresample=44100,aresample=48000,aformat=channel_layouts=stereo:sample_fmts=fltp",
++        "equalizer=f=1000:g=3,dynaudnorm=f=150:g=15,alimiter=limit=0.95,stereotools=balance_out=0.1,aformat=sample_fmts=fltp",
++    };
++    for (unsigned i = 0; i < sizeof(filters) / sizeof(filters[0]); i++) {
++        printf("history reset: %s\n", filters[i]);
++        CHECK(test_reset(filters[i]) == 0);
++    }
++    /* The unsupported-node preflight must not clear the source's EOF. */
++    {
++        AVFilterContext *src, *sink;
++        AVFilterGraph *g = create_graph("aecho,aformat=sample_fmts=fltp", &src, &sink);
++        CHECK(g);
++        CHECK(av_buffersrc_add_frame(src, NULL) >= 0);
++        CHECK(avfilter_graph_reset(g) == AVERROR(ENOSYS));
++        CHECK(feed(src, 0, 0) < 0);
++        avfilter_graph_free(&g);
++    }
++    if (argc > 1) {
++        char filter[4096];
++        AVFilterContext *src, *sink, *sofa;
++        AVFilterGraph *g;
++        double rotation;
++        /* Use a relative path, or escape the path as a lavfi option. */
++        snprintf(filter, sizeof(filter), "sofalizer@hrtf=sofa=%s:type=freq,aformat=sample_fmts=fltp", argv[1]);
++        CHECK(test_reset(filter) == 0);
++        g = create_graph(filter, &src, &sink); CHECK(g);
++        sofa = avfilter_graph_get_filter(g, "sofalizer@hrtf"); CHECK(sofa);
++        CHECK(avfilter_process_command(sofa, "rotation", "-355", NULL, 0, 0) == 0);
++        CHECK(avfilter_process_command(sofa, "elevation", "90", NULL, 0, 0) == 0);
++        CHECK(avfilter_graph_reset(g) == 0);
++        CHECK(av_opt_get_double(sofa->priv, "rotation", 0, &rotation) == 0 && rotation == -355);
++        CHECK(av_opt_get_double(sofa->priv, "elevation", 0, &rotation) == 0 && rotation == 90);
++        avfilter_graph_free(&g);
++    }
++    puts("history reset checks passed");
++    return 0;
++}
+diff --git a/libavfilter/version.h b/libavfilter/version.h
+index 77f38cb..4a69d6b 100644
+--- a/libavfilter/version.h
++++ b/libavfilter/version.h
+@@ -31,7 +31,7 @@
+ 
+ #include "version_major.h"
+ 
+-#define LIBAVFILTER_VERSION_MINOR   9
++#define LIBAVFILTER_VERSION_MINOR  10
+ #define LIBAVFILTER_VERSION_MICRO 100
+ 
+ 
+-- 
+2.54.0.windows.1
