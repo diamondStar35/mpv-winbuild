@@ -650,18 +650,5 @@ index 0000000..15d237f
 +    puts("history reset checks passed");
 +    return 0;
 +}
-diff --git a/libavfilter/version.h b/libavfilter/version.h
-index 77f38cb..4a69d6b 100644
---- a/libavfilter/version.h
-+++ b/libavfilter/version.h
-@@ -31,7 +31,7 @@
- 
- #include "version_major.h"
- 
--#define LIBAVFILTER_VERSION_MINOR   9
-+#define LIBAVFILTER_VERSION_MINOR  10
- #define LIBAVFILTER_VERSION_MICRO 100
- 
- 
 -- 
 2.54.0.windows.1
