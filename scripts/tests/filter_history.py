@@ -7,6 +7,7 @@ import io
 import os
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -31,7 +32,8 @@ class Player:
                                'input-default-bindings': 'no', 'af': graph}).items():
             assert library.mpv_set_option_string(self.handle, key.encode(), value.encode()) >= 0, key
         assert library.mpv_initialize(self.handle) >= 0
-        assert library.mpv_request_log_messages(self.handle, b'debug') >= 0
+        # FFmpeg's AV_LOG_DEBUG messages map to mpv's trace level.
+        assert library.mpv_request_log_messages(self.handle, b'trace') >= 0
 
     def command(self, *args):
         argv = (c.c_char_p * (len(args) + 1))(*[str(a).encode() for a in args], None)
@@ -81,13 +83,11 @@ class HistoryTests(unittest.TestCase):
         self.player = Player(LIBRARY, '@audiosofa:lavfi=graph=[sofalizer=sofa=fixture.sofa:type=freq],'
                              '@normalize:lavfi=[dynaudnorm=f=150:g=15,alimiter=limit=0.95],'
                              '@eq:lavfi=[equalizer=f=1000:g=3]')
+        self.addCleanup(self.player.close)
         self.player.command('loadfile', MEDIA)
         self.player.restart()
         self.initial_loads = self.player.loads
         self.assertGreater(self.initial_loads, 0)
-
-    def tearDown(self):
-        self.player.close()
 
     def test_seeks_retain_dataset_and_accept_directions(self):
         p = self.player
@@ -145,11 +145,17 @@ if __name__ == '__main__':
     LIBRARY.mpv_request_log_messages.argtypes = [c.c_void_p, c.c_char_p]
     LIBRARY.mpv_terminate_destroy.argtypes = [c.c_void_p]
     fixture = Path(__file__).with_name('hrtf.sofa.gz.base64').read_text()
+    previous_directory = Path.cwd()
     with tempfile.TemporaryDirectory(prefix='filter-history-') as workspace:
-        os.chdir(workspace)
-        Path('fixture.sofa').write_bytes(gzip.decompress(base64.b64decode(fixture)))
-        env = dict(os.environ, PATH=str(directory) + os.pathsep + os.environ['PATH'])
-        subprocess.run([str(directory / 'history_reset.exe'), 'fixture.sofa'], env=env, check=True,
-                       creationflags=subprocess.CREATE_NO_WINDOW, timeout=120)
-        MEDIA = wave_url()
-        unittest.main(argv=['filter_history'], verbosity=2)
+        try:
+            os.chdir(workspace)
+            Path('fixture.sofa').write_bytes(gzip.decompress(base64.b64decode(fixture)))
+            env = dict(os.environ, PATH=str(directory) + os.pathsep + os.environ['PATH'])
+            subprocess.run([str(directory / 'history_reset.exe'), 'fixture.sofa'], env=env, check=True,
+                           creationflags=subprocess.CREATE_NO_WINDOW, timeout=120)
+            MEDIA = wave_url()
+            result = unittest.main(argv=['filter_history'], verbosity=2, exit=False).result
+        finally:
+            # Windows cannot remove a directory that is still the process's cwd.
+            os.chdir(previous_directory)
+    sys.exit(0 if result.wasSuccessful() else 1)
