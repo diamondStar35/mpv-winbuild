@@ -99,6 +99,20 @@ and a newer pending direction replaces an older pending request. The existing
 `interpolate=1` option continues to interpolate between measured directions.
 Both +90 and -90 degrees are valid elevations and no longer wrap to zero.
 
+The audio-history patch adds `avfilter_graph_reset()` and reset callbacks for
+the audio filters used by Luna. Seeking clears queued frames, EOF and processing
+history while retaining negotiated formats, current parameters, and prepared
+SOFA data and FFT plans. Pausing leaves history intact. mpv retains its user
+audio chain across compatible decoder replacements. Incompatible formats and
+unsupported custom graphs rebuild with their current exposed runtime options
+restored; arbitrary command side effects are not replayed.
+
+The GPL shared x86-64-v2 workflow runs the native history regression executable
+and headless libmpv checks on Windows. The regression executable is uploaded as
+a separate `native-history-gpl-shared-64-v2` artifact and is excluded from the
+runtime archives. The tests check stale audio, fresh-graph equivalence, EOF
+recovery, runtime settings, compatible reloads and explicit removal.
+
 For an mpv audio filter labelled `audiosofa` containing a SOFAlizer instance,
 send `af-command audiosofa rotation -45 sofalizer` or
 `af-command audiosofa elevation 90 sofalizer`. Clients must send these commands

@@ -152,10 +152,10 @@ index 19a6c63..ec2a51d 100644
      FILTER_INPUTS(ff_audio_default_filterpad),           \
      FILTER_OUTPUTS(outputs),                             \
 diff --git a/libavfilter/af_dynaudnorm.c b/libavfilter/af_dynaudnorm.c
-index 98a3bb9..858f3a4 100644
+index 98a3bb9..6e0da97 100644
 --- a/libavfilter/af_dynaudnorm.c
 +++ b/libavfilter/af_dynaudnorm.c
-@@ -1026,6 +1026,28 @@ static int process_command(AVFilterContext *ctx, const char *cmd, const char *ar
+@@ -1026,6 +1026,36 @@ static int process_command(AVFilterContext *ctx, const char *cmd, const char *ar
      return 0;
  }
  
@@ -176,6 +176,14 @@ index 98a3bb9..858f3a4 100644
 +            queues[i]->nb_elements = 0;
 +    }
 +    s->is_enabled->nb_elements = 0;
++    if (s->expr_str) {
++        AVExpr *expr = NULL;
++        int ret = av_expr_parse(&expr, s->expr_str, var_names, NULL, NULL, NULL, NULL, 0, ctx);
++        if (ret < 0)
++            return ret;
++        av_expr_free(s->expr);
++        s->expr = expr;
++    }
 +    av_samples_set_silence(s->window->extended_data, 0, s->window->nb_samples,
 +                           s->window->ch_layout.nb_channels, s->window->format);
 +    return 0;
@@ -184,7 +192,7 @@ index 98a3bb9..858f3a4 100644
  static const AVFilterPad avfilter_af_dynaudnorm_inputs[] = {
      {
          .name           = "default",
-@@ -1035,6 +1057,7 @@ static const AVFilterPad avfilter_af_dynaudnorm_inputs[] = {
+@@ -1035,6 +1065,7 @@ static const AVFilterPad avfilter_af_dynaudnorm_inputs[] = {
  };
  
  const FFFilter ff_af_dynaudnorm = {
@@ -314,10 +322,10 @@ index a6b875c..7146589 100644
   * @}
   */
 diff --git a/libavfilter/avfiltergraph.c b/libavfilter/avfiltergraph.c
-index 7d089ad..ef980bd 100644
+index 7d089ad..af6b601 100644
 --- a/libavfilter/avfiltergraph.c
 +++ b/libavfilter/avfiltergraph.c
-@@ -1655,3 +1655,59 @@ int ff_filter_graph_run_once(AVFilterGraph *graph)
+@@ -1655,3 +1655,65 @@ int ff_filter_graph_run_once(AVFilterGraph *graph)
          return AVERROR(EAGAIN);
      return ff_filter_activate(&ctxi->p);
  }
@@ -371,6 +379,12 @@ index 7d089ad..ef980bd 100644
 +        ret = fffilter(ctx->filter)->reset(ctx);
 +        if (ret < 0)
 +            return ret;
++        if (ctx->enable_str) {
++            ret = avfilter_process_command(ctx, "enable", ctx->enable_str, NULL, 0, 0);
++            if (ret < 0)
++                return ret;
++        }
++        ctx->is_disabled = 0;
 +    }
 +    /* All timestamps are equal again, so the existing sink heap is valid. */
 +    for (int i = 0; i < g->sink_links_count; i++)
@@ -437,10 +451,10 @@ index 2df05a7..dc205b2 100644
  static inline const FFFilter *fffilter(const AVFilter *f)
 diff --git a/libavfilter/tests/history_reset.c b/libavfilter/tests/history_reset.c
 new file mode 100644
-index 0000000..f68d400
+index 0000000..15d237f
 --- /dev/null
 +++ b/libavfilter/tests/history_reset.c
-@@ -0,0 +1,157 @@
+@@ -0,0 +1,195 @@
 +/* Regression coverage for the history-only graph reset API. LGPL-2.1-or-later. */
 +#include <errno.h>
 +#include <math.h>
@@ -498,6 +512,8 @@ index 0000000..f68d400
 +    return ret;
 +}
 +
++static double output_energy;
++
 +static int drain(AVFilterContext *sink, int silent, int *frames)
 +{
 +    AVFrame *f = av_frame_alloc();
@@ -506,13 +522,15 @@ index 0000000..f68d400
 +    while ((ret = av_buffersink_get_frame(sink, f)) >= 0) {
 +        (*frames)++;
 +        if (f->format != AV_SAMPLE_FMT_FLTP) { ret = AVERROR_INVALIDDATA; break; }
-+        if (silent) {
-+            for (int c = 0; c < f->ch_layout.nb_channels; c++)
-+                for (int n = 0; n < f->nb_samples; n++)
-+                    if (fabsf(((float *)f->extended_data[c])[n]) > 1e-7f) {
-+                        av_frame_free(&f);
-+                        return AVERROR_INVALIDDATA;
-+                    }
++        for (int c = 0; c < f->ch_layout.nb_channels; c++) {
++            for (int n = 0; n < f->nb_samples; n++) {
++                double value = ((float *)f->extended_data[c])[n];
++                output_energy += value * value;
++                if (silent && fabs(value) > 1e-7) {
++                    av_frame_free(&f);
++                    return AVERROR_INVALIDDATA;
++                }
++            }
 +        }
 +        av_frame_unref(f);
 +    }
@@ -544,6 +562,27 @@ index 0000000..f68d400
 +        CHECK(av_buffersrc_add_frame(src, NULL) >= 0);
 +        CHECK(drain(sink, 1, &frames) == 0);
 +        CHECK(avfilter_graph_reset(g) == 0);
++        {
++            AVFilterContext *fresh_src, *fresh_sink;
++            AVFilterGraph *fresh = create_graph(filter, &fresh_src, &fresh_sink);
++            double actual, expected;
++            int actual_frames = 0, expected_frames = 0;
++            CHECK(fresh);
++            output_energy = 0;
++            CHECK(feed(src, 0, 1) >= 0);
++            CHECK(av_buffersrc_add_frame(src, NULL) >= 0);
++            CHECK(drain(sink, 0, &actual_frames) == 0);
++            actual = output_energy;
++            output_energy = 0;
++            CHECK(feed(fresh_src, 0, 1) >= 0);
++            CHECK(av_buffersrc_add_frame(fresh_src, NULL) >= 0);
++            CHECK(drain(fresh_sink, 0, &expected_frames) == 0);
++            expected = output_energy;
++            CHECK(actual_frames == expected_frames);
++            CHECK(fabs(actual - expected) <= 1e-7 * (1 + expected));
++            avfilter_graph_free(&fresh);
++            CHECK(avfilter_graph_reset(g) == 0);
++        }
 +    }
 +    CHECK(frames > 0 || strstr(filter, "silenceremove"));
 +    av_free(identities);
@@ -567,6 +606,19 @@ index 0000000..f68d400
 +    for (unsigned i = 0; i < sizeof(filters) / sizeof(filters[0]); i++) {
 +        printf("history reset: %s\n", filters[i]);
 +        CHECK(test_reset(filters[i]) == 0);
++    }
++    {
++        AVFilterContext *src, *sink, *tone;
++        AVFilterGraph *g = create_graph("equalizer@tone=f=1000:g=3,aformat=sample_fmts=fltp", &src, &sink);
++        double gain;
++        CHECK(g);
++        tone = avfilter_graph_get_filter(g, "equalizer@tone"); CHECK(tone);
++        CHECK(avfilter_process_command(tone, "g", "9", NULL, 0, 0) == 0);
++        CHECK(avfilter_process_command(tone, "enable", "0", NULL, 0, 0) == 0);
++        CHECK(avfilter_graph_reset(g) == 0);
++        CHECK(av_opt_get_double(tone->priv, "g", 0, &gain) == 0 && gain == 9);
++        CHECK(tone->enable_str && !strcmp(tone->enable_str, "0"));
++        avfilter_graph_free(&g);
 +    }
 +    /* The unsupported-node preflight must not clear the source's EOF. */
 +    {

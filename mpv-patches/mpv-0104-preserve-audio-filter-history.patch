@@ -36,7 +36,7 @@ index 1b255690f1..fb8b09eecb 100644
  ``audio-crossfade``
      Native cross-fade state, as a map with these sub-properties:
 diff --git a/filters/f_lavfi.c b/filters/f_lavfi.c
-index ce59f576d5..144a7383a5 100644
+index ce59f576d5..a0a8ef7917 100644
 --- a/filters/f_lavfi.c
 +++ b/filters/f_lavfi.c
 @@ -55,6 +55,10 @@
@@ -68,7 +68,7 @@ index ce59f576d5..144a7383a5 100644
  
      // Filter can't be put into a working state.
      bool failed;
-@@ -131,10 +139,54 @@ struct lavfi_pad {
+@@ -131,10 +139,62 @@ struct lavfi_pad {
      struct mp_frame in_fmt;
  };
  
@@ -82,6 +82,14 @@ index ce59f576d5..144a7383a5 100644
 +    c->num_options = 0;
 +    for (unsigned i = 0; i < c->graph->nb_filters; i++) {
 +        AVFilterContext *f = c->graph->filters[i];
++        if (f->enable_str) {
++            struct saved_option saved = {0};
++            MP_TARRAY_APPEND(c, c->options, c->num_options, saved);
++            struct saved_option *s = &c->options[c->num_options - 1];
++            s->filter = talloc_strdup(c->options, f->name);
++            s->key = talloc_strdup(c->options, "enable");
++            s->value = talloc_strdup(c->options, f->enable_str);
++        }
 +        const AVOption *opt = NULL;
 +        while (f->priv && (opt = av_opt_next(f->priv, opt))) {
 +            uint8_t *value = NULL;
@@ -123,7 +131,7 @@ index ce59f576d5..144a7383a5 100644
      avfilter_graph_free(&c->graph);
      for (int n = 0; n < c->num_all_pads; n++) {
          struct lavfi_pad *pad = c->all_pads[n];
-@@ -148,6 +200,7 @@ static void free_graph(struct lavfi *c)
+@@ -148,6 +208,7 @@ static void free_graph(struct lavfi *c)
      }
      c->initialized = false;
      c->draining_recover = false;
@@ -131,7 +139,7 @@ index ce59f576d5..144a7383a5 100644
      c->in_pts = MP_NOPTS_VALUE;
      c->in_samples = 0;
      c->delay = 0;
-@@ -377,6 +430,7 @@ static void read_pad_input(struct lavfi *c, struct lavfi_pad *pad)
+@@ -377,6 +438,7 @@ static void read_pad_input(struct lavfi *c, struct lavfi_pad *pad)
          if (!c->draining_recover)
              MP_VERBOSE(c, "format change on %s\n", pad->name);
          c->draining_recover = true;
@@ -139,7 +147,7 @@ index ce59f576d5..144a7383a5 100644
          if (c->initialized)
              send_global_eof(c);
      }
-@@ -580,6 +634,12 @@ static void init_graph(struct lavfi *c)
+@@ -580,6 +642,12 @@ static void init_graph(struct lavfi *c)
              return;
          }
  
@@ -152,7 +160,7 @@ index ce59f576d5..144a7383a5 100644
          // The timebase is available after configuring.
          for (int n = 0; n < c->num_out_pads; n++) {
              struct lavfi_pad *pad = c->out_pads[n];
-@@ -757,6 +817,8 @@ static bool read_output_pads(struct lavfi *c)
+@@ -757,6 +825,8 @@ static bool read_output_pads(struct lavfi *c)
      return progress;
  }
  
@@ -161,7 +169,7 @@ index ce59f576d5..144a7383a5 100644
  static void lavfi_process(struct mp_filter *f)
  {
      struct lavfi *c = f->priv;
-@@ -780,7 +842,10 @@ static void lavfi_process(struct mp_filter *f)
+@@ -780,7 +850,10 @@ static void lavfi_process(struct mp_filter *f)
  
          if (all_eof) {
              MP_VERBOSE(c, "recovering all eof\n");
@@ -173,7 +181,7 @@ index ce59f576d5..144a7383a5 100644
              mp_filter_internal_mark_progress(c->f);
          }
      }
-@@ -789,12 +854,30 @@ static void lavfi_process(struct mp_filter *f)
+@@ -789,12 +862,30 @@ static void lavfi_process(struct mp_filter *f)
          mp_filter_internal_mark_failed(c->f);
  }
  
@@ -207,7 +215,7 @@ index ce59f576d5..144a7383a5 100644
      for (int n = 0; n < c->num_in_pads; n++)
          mp_frame_unref(&c->in_pads[n]->pending);
  }
-@@ -803,6 +886,7 @@ static void lavfi_destroy(struct mp_filter *f)
+@@ -803,6 +894,7 @@ static void lavfi_destroy(struct mp_filter *f)
  {
      struct lavfi *c = f->priv;
  
