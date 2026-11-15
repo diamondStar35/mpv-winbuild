@@ -129,6 +129,26 @@ class HistoryTests(unittest.TestCase):
         self.assertGreater(p.loads, self.initial_loads)
 
 
+class NormalizationTests(unittest.TestCase):
+    def test_format_changes_keep_normalization_active(self):
+        # SOFA processing can force a constant sample rate and hide this transition.
+        p = Player(LIBRARY, '@normalize:lavfi=[dynaudnorm=f=150:g=15,alimiter=limit=0.95]')
+        self.addCleanup(p.close)
+        p.command('loadfile', MEDIA)
+        p.restart()
+        p.command('af-command', 'normalize', 'peak', '0.8', 'dynaudnorm')
+        for rate, channels in [(8000, 1), (48000, 2), (44100, 1)]:
+            p.command('loadfile', wave_url(rate, channels))
+            p.restart()
+            # A failed lavfi graph can be bypassed while playback still restarts normally.
+            # Sending a command proves the normalizer remains in the active audio chain.
+            p.pump()
+            self.assertFalse(any('could not restore runtime option' in line
+                                 or 'Disabling filter normalize' in line for line in p.logs),
+                             '\n'.join(p.logs[-30:]))
+            p.command('af-command', 'normalize', 'peak', '0.8', 'dynaudnorm')
+
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('directory', type=Path)
