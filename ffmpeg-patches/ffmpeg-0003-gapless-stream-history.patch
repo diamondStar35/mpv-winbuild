@@ -1,0 +1,425 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: diamondStar35 <ramymaherali55@gmail.com>
+Date: Sun, 15 Nov 2026 21:00:00 +0200
+Subject: [PATCH] avfilter: rearm drained audio graphs for gapless recordings
+
+Add avfilter_graph_new_stream for recording boundaries, distinct from a
+seek reset. Preserve streaming EQ, limiter and spatial signal history,
+while restarting the normalizer analysis. Retain only its output-gain
+endpoint to interpolate smoothly into the fresh recording.
+
+Cover streaming continuity, fresh analysis, timestamp restart and seek
+history clearing in the native regression executable.
+---
+diff --git a/libavfilter/af_alimiter.c b/libavfilter/af_alimiter.c
+index 8af2651..15bffca 100644
+--- a/libavfilter/af_alimiter.c
++++ b/libavfilter/af_alimiter.c
+@@ -421,6 +421,17 @@ static int reset_history(AVFilterContext *ctx)
+     return 0;
+ }
+ 
++static int new_stream(AVFilterContext *ctx)
++{
++    AudioLimiterContext *s = ctx->priv;
++    /* Latency compensation has already padded the preceding recording. */
++    if (s->latency)
++        return reset_history(ctx);
++    av_fifo_reset2(s->fifo);
++    s->next_in_pts = s->next_out_pts = AV_NOPTS_VALUE;
++    return 0;
++}
++
+ static const AVFilterPad alimiter_inputs[] = {
+     {
+         .name         = "main",
+@@ -439,6 +450,7 @@ static const AVFilterPad alimiter_outputs[] = {
+ };
+ 
+ const FFFilter ff_af_alimiter = {
++    .new_stream    = new_stream,
+     .reset         = reset_history,
+     .p.name         = "alimiter",
+     .p.description  = NULL_IF_CONFIG_SMALL("Audio lookahead limiter."),
+diff --git a/libavfilter/af_biquads.c b/libavfilter/af_biquads.c
+index ec2a51d..0e43805 100644
+--- a/libavfilter/af_biquads.c
++++ b/libavfilter/af_biquads.c
+@@ -1463,6 +1463,17 @@ static int reset_history(AVFilterContext *ctx)
+     return 0;
+ }
+ 
++static int new_stream(AVFilterContext *ctx)
++{
++    BiquadsContext *s = ctx->priv;
++    if (s->block_samples > 0)
++        return reset_history(ctx);
++    memset(s->clip, 0, ctx->inputs[0]->ch_layout.nb_channels * sizeof(*s->clip));
++    s->pts = AV_NOPTS_VALUE;
++    s->nb_samples = 0;
++    return 0;
++}
++
+ #define DEFINE_BIQUAD_FILTER_2(name_, description_, priv_class_)        \
+ static av_cold int name_##_init(AVFilterContext *ctx)                   \
+ {                                                                       \
+@@ -1482,6 +1493,7 @@ const FFFilter ff_af_##name_ = {                         \
+     .init          = name_##_init,                       \
+     .activate      = activate,                           \
+     .reset         = reset_history, \
++    .new_stream    = new_stream, \
+     .uninit        = uninit,                             \
+     FILTER_INPUTS(ff_audio_default_filterpad),           \
+     FILTER_OUTPUTS(outputs),                             \
+diff --git a/libavfilter/af_dynaudnorm.c b/libavfilter/af_dynaudnorm.c
+index 6e0da97..1e5fc8c 100644
+--- a/libavfilter/af_dynaudnorm.c
++++ b/libavfilter/af_dynaudnorm.c
+@@ -94,6 +94,7 @@ typedef struct DynamicAudioNormalizerContext {
+     double compress_factor;
+     double threshold;
+     double *prev_amplification_factor;
++    int preserve_gain;
+     double *dc_correction_value;
+     double *compress_threshold;
+     double *weights;
+@@ -530,7 +531,8 @@ static void update_gain_history(DynamicAudioNormalizerContext *s, int channel,
+         const int pre_fill_size = s->filter_size / 2;
+         const double initial_value = s->alt_boundary_mode ? gain.max_gain : fmin(1.0, gain.max_gain);
+ 
+-        s->prev_amplification_factor[channel] = initial_value;
++        if (!s->preserve_gain)
++            s->prev_amplification_factor[channel] = initial_value;
+ 
+         while (cqueue_size(s->gain_history_original[channel]) < pre_fill_size) {
+             cqueue_enqueue(s->gain_history_original[channel], initial_value);
+@@ -795,6 +797,7 @@ static int analyze_frame(AVFilterContext *ctx, AVFilterLink *outlink, AVFrame **
+         ff_filter_execute(ctx, update_gain_histories, analyze_frame, NULL,
+                           FFMIN(s->channels, ff_filter_get_nb_threads(ctx)));
+     }
++    s->preserve_gain = 0;
+ 
+     return 0;
+ }
+@@ -1026,7 +1029,7 @@ static int process_command(AVFilterContext *ctx, const char *cmd, const char *ar
+     return 0;
+ }
+ 
+-static int reset_history(AVFilterContext *ctx)
++static int reset_analysis(AVFilterContext *ctx, int preserve_gain)
+ {
+     DynamicAudioNormalizerContext *s = ctx->priv;
+     ff_bufqueue_discard_all(&s->queue);
+@@ -1034,10 +1037,12 @@ static int reset_history(AVFilterContext *ctx)
+     s->pts = AV_NOPTS_VALUE;
+     s->var_values[VAR_T] = NAN;
+     s->var_values[VAR_SN] = 0;
++    s->preserve_gain = preserve_gain;
+     for (int c = 0; c < s->channels; c++) {
+         cqueue *queues[] = { s->gain_history_original[c], s->gain_history_minimum[c],
+                             s->gain_history_smoothed[c], s->threshold_history[c] };
+-        s->prev_amplification_factor[c] = 1.;
++        if (!preserve_gain)
++            s->prev_amplification_factor[c] = 1.;
+         s->dc_correction_value[c] = s->compress_threshold[c] = 0.;
+         for (unsigned i = 0; i < FF_ARRAY_ELEMS(queues); i++)
+             queues[i]->nb_elements = 0;
+@@ -1056,6 +1061,18 @@ static int reset_history(AVFilterContext *ctx)
+     return 0;
+ }
+ 
++static int reset_history(AVFilterContext *ctx)
++{
++    return reset_analysis(ctx, 0);
++}
++
++static int new_stream(AVFilterContext *ctx)
++{
++    /* Gain interpolation is signal continuity, not the analysis window.
++     * Keep its endpoint while starting a fresh analysis for the next recording. */
++    return reset_analysis(ctx, 1);
++}
++
+ static const AVFilterPad avfilter_af_dynaudnorm_inputs[] = {
+     {
+         .name           = "default",
+@@ -1065,6 +1082,7 @@ static const AVFilterPad avfilter_af_dynaudnorm_inputs[] = {
+ };
+ 
+ const FFFilter ff_af_dynaudnorm = {
++    .new_stream    = new_stream,
+     .reset         = reset_history,
+     .p.name        = "dynaudnorm",
+     .p.description = NULL_IF_CONFIG_SMALL("Dynamic Audio Normalizer."),
+diff --git a/libavfilter/af_sofalizer.c b/libavfilter/af_sofalizer.c
+index a0287c6..0377199 100644
+--- a/libavfilter/af_sofalizer.c
++++ b/libavfilter/af_sofalizer.c
+@@ -957,6 +957,12 @@ static int reset_history(AVFilterContext *ctx)
+     return 0;
+ }
+ 
++static int new_stream(AVFilterContext *ctx)
++{
++    (void)ctx;
++    return 0;
++}
++
+ static const AVFilterPad inputs[] = {
+     {
+         .name         = "default",
+@@ -966,6 +972,7 @@ static const AVFilterPad inputs[] = {
+ };
+ 
+ const FFFilter ff_af_sofalizer = {
++    .new_stream    = new_stream,
+     .reset         = reset_history,
+     .p.name        = "sofalizer",
+     .p.description = NULL_IF_CONFIG_SMALL("SOFAlizer (Spatially Oriented Format for Acoustics)."),
+diff --git a/libavfilter/af_stereotools.c b/libavfilter/af_stereotools.c
+index 8dbc233..5b9e927 100644
+--- a/libavfilter/af_stereotools.c
++++ b/libavfilter/af_stereotools.c
+@@ -387,7 +387,14 @@ static const AVFilterPad inputs[] = {
+     },
+ };
+ 
++static int new_stream(AVFilterContext *ctx)
++{
++    (void)ctx;
++    return 0;
++}
++
+ const FFFilter ff_af_stereotools = {
++    .new_stream    = new_stream,
+     .reset         = reset_history,
+     .p.name         = "stereotools",
+     .p.description  = NULL_IF_CONFIG_SMALL("Apply various stereo tools."),
+diff --git a/libavfilter/avfilter.h b/libavfilter/avfilter.h
+index a790fbc..ee99a50 100644
+--- a/libavfilter/avfilter.h
++++ b/libavfilter/avfilter.h
+@@ -1230,6 +1230,13 @@ int avfilter_graph_request_oldest(AVFilterGraph *graph);
+  */
+ int avfilter_graph_reset(AVFilterGraph *graph);
+ 
++/** Start a compatible recording after the previous recording has drained.
++ * Re-arm EOF and timestamps while retaining signal-processing history.
++ * Analysis filters start a fresh analysis. Runtime options remain configured.
++ * No graph execution may be in progress when this function is called.
++ */
++int avfilter_graph_new_stream(AVFilterGraph *graph);
++
+ /**
+  * @}
+  */
+diff --git a/libavfilter/avfiltergraph.c b/libavfilter/avfiltergraph.c
+index a7c3096..b8cd014 100644
+--- a/libavfilter/avfiltergraph.c
++++ b/libavfilter/avfiltergraph.c
+@@ -1691,13 +1691,14 @@ int ff_filter_graph_run_once(AVFilterGraph *graph)
+     return ff_filter_activate(&ctxi->p);
+ }
+ 
+-int avfilter_graph_reset(AVFilterGraph *graph)
++static int reset_audio_graph(AVFilterGraph *graph, int new_stream)
+ {
+-    FFFilterGraph *g = fffiltergraph(graph);
++    FFFilterGraph *g;
+     int ret;
+ 
+     if (!graph || !graph->nb_filters)
+         return AVERROR(EINVAL);
++    g = fffiltergraph(graph);
+     /* Preflight every node before changing any state, including auto converters. */
+     for (unsigned i = 0; i < graph->nb_filters; i++) {
+         AVFilterContext *ctx = graph->filters[i];
+@@ -1737,7 +1738,8 @@ int avfilter_graph_reset(AVFilterGraph *graph)
+             li->l.frame_count_in = li->l.frame_count_out = 0;
+             li->l.sample_count_in = li->l.sample_count_out = 0;
+         }
+-        ret = fffilter(ctx->filter)->reset(ctx);
++        const FFFilter *filter = fffilter(ctx->filter);
++        ret = new_stream && filter->new_stream ? filter->new_stream(ctx) : filter->reset(ctx);
+         if (ret < 0)
+             return ret;
+         if (ctx->enable_str) {
+@@ -1752,3 +1754,13 @@ int avfilter_graph_reset(AVFilterGraph *graph)
+         g->sink_links[i]->age_index = i;
+     return 0;
+ }
++
++int avfilter_graph_reset(AVFilterGraph *graph)
++{
++    return reset_audio_graph(graph, 0);
++}
++
++int avfilter_graph_new_stream(AVFilterGraph *graph)
++{
++    return reset_audio_graph(graph, 1);
++}
+diff --git a/libavfilter/filters.h b/libavfilter/filters.h
+index dc205b2..8cc7cc3 100644
+--- a/libavfilter/filters.h
++++ b/libavfilter/filters.h
+@@ -480,6 +480,10 @@ typedef struct FFFilter {
+      * A failure requires the caller to rebuild the graph before further use.
+      */
+     int (*reset)(AVFilterContext *ctx);
++    /** Start another compatible recording without dropping signal history.
++     * NULL uses reset(), including a fresh analysis for per-track processors.
++     */
++    int (*new_stream)(AVFilterContext *ctx);
+ } FFFilter;
+ 
+ static inline const FFFilter *fffilter(const AVFilter *f)
+diff --git a/libavfilter/tests/history_reset.c b/libavfilter/tests/history_reset.c
+index 15d237f..2ace7f1 100644
+--- a/libavfilter/tests/history_reset.c
++++ b/libavfilter/tests/history_reset.c
+@@ -133,6 +133,126 @@ static int test_reset(const char *filter)
+     return 0;
+ }
+ 
++static int feed_tone(AVFilterContext *src, int64_t start, int64_t pts, double amplitude)
++{
++    AVFrame *f = av_frame_alloc();
++    int ret;
++    if (!f) return AVERROR(ENOMEM);
++    f->format = AV_SAMPLE_FMT_FLTP; f->sample_rate = 48000;
++    f->ch_layout = (AVChannelLayout)AV_CHANNEL_LAYOUT_STEREO;
++    f->nb_samples = 1024; f->pts = pts;
++    ret = av_frame_get_buffer(f, 0);
++    if (ret >= 0) {
++        for (int ch = 0; ch < 2; ch++)
++            for (int i = 0; i < f->nb_samples; i++)
++                ((float *)f->extended_data[ch])[i] = amplitude * sin(2 * M_PI * 523.25 * (start + i) / 48000);
++        ret = av_buffersrc_add_frame(src, f);
++    }
++    av_frame_free(&f);
++    return ret;
++}
++
++static int read_signal(AVFilterContext *sink, float *samples, int *count, int capacity)
++{
++    AVFrame *f = av_frame_alloc();
++    int ret;
++    if (!f) return AVERROR(ENOMEM);
++    while ((ret = av_buffersink_get_frame(sink, f)) >= 0) {
++        if (f->format != AV_SAMPLE_FMT_FLTP || f->nb_samples > capacity - *count) {
++            av_frame_free(&f);
++            return AVERROR_INVALIDDATA;
++        }
++        memcpy(samples + *count, f->extended_data[0], f->nb_samples * sizeof(*samples));
++        *count += f->nb_samples;
++        av_frame_unref(f);
++    }
++    av_frame_free(&f);
++    return ret == AVERROR(EAGAIN) || ret == AVERROR_EOF ? 0 : ret;
++}
++
++static int test_stream_continuity(const char *filter)
++{
++    AVFilterContext *src, *sink, *ref_src, *ref_sink;
++    AVFilterGraph *g = create_graph(filter, &src, &sink);
++    AVFilterGraph *reference = create_graph(filter, &ref_src, &ref_sink);
++    enum { CAPACITY = 32 * 1024 };
++    float *actual = av_malloc_array(CAPACITY, sizeof(*actual));
++    float *expected = av_malloc_array(CAPACITY, sizeof(*expected));
++    int actual_count = 0, expected_count = 0;
++    CHECK(g && reference && actual && expected);
++    for (int i = 0; i < 32; i++) {
++        CHECK(feed_tone(src, i * 1024, (i % 16) * 1024, 0.1) >= 0);
++        CHECK(feed_tone(ref_src, i * 1024, i * 1024, 0.1) >= 0);
++        CHECK(read_signal(sink, actual, &actual_count, CAPACITY) == 0);
++        CHECK(read_signal(ref_sink, expected, &expected_count, CAPACITY) == 0);
++        if (i == 15) {
++            CHECK(av_buffersrc_add_frame(src, NULL) >= 0);
++            CHECK(read_signal(sink, actual, &actual_count, CAPACITY) == 0);
++            CHECK(avfilter_graph_new_stream(g) == 0);
++        }
++    }
++    CHECK(av_buffersrc_add_frame(src, NULL) >= 0);
++    CHECK(av_buffersrc_add_frame(ref_src, NULL) >= 0);
++    CHECK(read_signal(sink, actual, &actual_count, CAPACITY) == 0);
++    CHECK(read_signal(ref_sink, expected, &expected_count, CAPACITY) == 0);
++    CHECK(actual_count == expected_count && actual_count == CAPACITY);
++    for (int i = 0; i < actual_count; i++)
++        CHECK(fabs(actual[i] - expected[i]) < 1e-6);
++    av_free(actual); av_free(expected);
++    avfilter_graph_free(&g); avfilter_graph_free(&reference);
++    return 0;
++}
++
++static int test_fresh_analysis(void)
++{
++    const char *filter = "dynaudnorm=f=150:g=15:b=1,aformat=sample_fmts=fltp";
++    AVFilterContext *src, *sink, *ref_src, *ref_sink;
++    AVFilterGraph *g = create_graph(filter, &src, &sink);
++    AVFilterGraph *reference = create_graph(filter, &ref_src, &ref_sink);
++    enum { CAPACITY = 160 * 1024 };
++    float *actual = av_malloc_array(CAPACITY, sizeof(*actual));
++    float *expected = av_malloc_array(CAPACITY, sizeof(*expected));
++    int actual_count = 0, expected_count = 0;
++    double difference = 0, previous_gain, next_gain, tone;
++    CHECK(g && reference && actual && expected);
++    for (int i = 0; i < 160; i++) {
++        CHECK(feed_tone(src, i * 1024, i * 1024, 0.1) >= 0);
++        CHECK(read_signal(sink, actual, &actual_count, CAPACITY) == 0);
++    }
++    CHECK(av_buffersrc_add_frame(src, NULL) >= 0);
++    CHECK(read_signal(sink, actual, &actual_count, CAPACITY) == 0);
++    CHECK(actual_count == CAPACITY);
++    previous_gain = actual[CAPACITY - 1] /
++        (0.1 * sin(2 * M_PI * 523.25 * (CAPACITY - 1) / 48000));
++    CHECK(avfilter_graph_new_stream(g) == 0);
++    actual_count = 0;
++    for (int i = 0; i < 160; i++) {
++        CHECK(feed_tone(src, i * 1024, i * 1024, 0.25) >= 0);
++        CHECK(feed_tone(ref_src, i * 1024, i * 1024, 0.25) >= 0);
++        CHECK(read_signal(sink, actual, &actual_count, CAPACITY) == 0);
++        CHECK(read_signal(ref_sink, expected, &expected_count, CAPACITY) == 0);
++    }
++    CHECK(av_buffersrc_add_frame(src, NULL) >= 0);
++    CHECK(av_buffersrc_add_frame(ref_src, NULL) >= 0);
++    CHECK(read_signal(sink, actual, &actual_count, CAPACITY) == 0);
++    CHECK(read_signal(ref_sink, expected, &expected_count, CAPACITY) == 0);
++    CHECK(actual_count == CAPACITY && expected_count == CAPACITY);
++    /* Only the first gain ramp continues the previous output. Every later
++     * frame must use the same fresh analysis as an independent recording. */
++    for (int i = 0; i < 7200; i++)
++        difference += fabs(actual[i] - expected[i]);
++    CHECK(difference > 1);
++    for (int i = 7200; i < CAPACITY; i++)
++        CHECK(fabs(actual[i] - expected[i]) < 1e-6);
++    CHECK(fabs(actual[0]) < 1e-7);
++    tone = 0.25 * sin(2 * M_PI * 523.25 / 48000);
++    next_gain = expected[1] / tone;
++    CHECK(fabs(actual[1] / tone - (previous_gain + (next_gain - previous_gain) * 2 / 7200)) < 1e-5);
++    av_free(actual); av_free(expected);
++    avfilter_graph_free(&g); avfilter_graph_free(&reference);
++    return 0;
++}
++
+ int main(int argc, char **argv)
+ {
+     static const char *filters[] = {
+@@ -146,6 +266,9 @@ int main(int argc, char **argv)
+         "aformat=channel_layouts=mono,aresample=44100,aresample=48000,aformat=channel_layouts=stereo:sample_fmts=fltp",
+         "equalizer=f=1000:g=3,dynaudnorm=f=150:g=15,alimiter=limit=0.95,stereotools=balance_out=0.1,aformat=sample_fmts=fltp",
+     };
++    CHECK(test_stream_continuity("equalizer=f=600:g=10,alimiter=limit=0.95,aformat=sample_fmts=fltp") == 0);
++    CHECK(test_stream_continuity("stereotools=delay=20,aformat=sample_fmts=fltp") == 0);
++    CHECK(test_fresh_analysis() == 0);
+     for (unsigned i = 0; i < sizeof(filters) / sizeof(filters[0]); i++) {
+         printf("history reset: %s\n", filters[i]);
+         CHECK(test_reset(filters[i]) == 0);
+@@ -178,6 +301,8 @@ int main(int argc, char **argv)
+         AVFilterContext *src, *sink, *sofa;
+         AVFilterGraph *g;
+         double rotation;
++        snprintf(filter, sizeof(filter), "sofalizer=sofa='%s':type=freq,aformat=sample_fmts=fltp", argv[1]);
++        CHECK(test_stream_continuity(filter) == 0);
+         /* Use a relative path, or escape the path as a lavfi option. */
+         snprintf(filter, sizeof(filter), "sofalizer@hrtf=sofa=%s:type=freq,aformat=sample_fmts=fltp", argv[1]);
+         CHECK(test_reset(filter) == 0);

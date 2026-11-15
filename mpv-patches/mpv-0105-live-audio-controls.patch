@@ -1,0 +1,746 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: diamondStar35 <ramymaherali55@gmail.com>
+Date: Sun, 15 Nov 2026 21:00:00 +0200
+Subject: [PATCH] audio: preserve live controls and gapless signal history
+
+Keep output buffering short during ordinary playback and prepare overlap PCM
+asynchronously at handoff. Reuse the running device for in-track PCM
+changes independently of the gapless file-transition policy.
+
+Separate seeks from natural gapless boundaries. Preserve compatible signal
+history, re-arm EOF once, and start per-recording analysis afresh. Convert
+gapless PCM before effects without reducing precision or source channels.
+---
+diff --git a/DOCS/interface-changes/audio-filter-history-reset.txt b/DOCS/interface-changes/audio-filter-history-reset.txt
+index 4e08d89c62..761631b3d3 100644
+--- a/DOCS/interface-changes/audio-filter-history-reset.txt
++++ b/DOCS/interface-changes/audio-filter-history-reset.txt
+@@ -1,3 +1,6 @@
+ Audio lavfi graphs with reset support retain instances and runtime options on seek.
+ Compatible decoder replacements retain user audio processing. The read-only
+ audio-filter-history-reset property reports support for this lifecycle.
++Natural gapless boundaries continue compatible signal history while restarting
++per-recording analysis. A stable PCM sample representation before effects
++preserves precision without forcing the first decoder's rate or channels.
+diff --git a/DOCS/man/input.rst b/DOCS/man/input.rst
+index da257817bf..2abd54a7bf 100644
+--- a/DOCS/man/input.rst
++++ b/DOCS/man/input.rst
+@@ -347,9 +347,11 @@ Playback Control
+     outgoing file and mixes it with the incoming decoder's output on the same
+     audio device. It never replays audio that has already been heard.
+ 
+-    Configure ``--audio-crossfade-buffer`` before playback to reserve enough
+-    outgoing PCM. Without sufficient buffering, the overlap is shorter than
+-    requested. The result map includes ``playlist_entry_id`` and ``captured``
++    Outgoing PCM is prepared asynchronously when the command is requested,
++    without holding a long post-filter reserve throughout normal playback.
++    Preparation waits at most 250 ms for decoded audio. If less is ready,
++    the overlap is shorter than requested. The result map includes
++    ``playlist_entry_id`` and ``captured``
+     (retained seconds). ``audio-crossfade`` reports live output state. Memory is
+     bounded to 64 MiB each for the optional lookahead and the outgoing reserve.
+ 
+diff --git a/DOCS/man/options.rst b/DOCS/man/options.rst
+index 2f97d75518..bab731f12f 100644
+--- a/DOCS/man/options.rst
++++ b/DOCS/man/options.rst
+@@ -2481,7 +2481,7 @@ Audio
+ ``--audio-crossfade-duration=<seconds>``
+     Automatically cross-fade between queued audio playlist entries. Accepts
+     0 to 30 seconds; zero disables automatic transitions (the default). Set
+-    this before loading a file. It reserves decoded PCM lookahead itself;
++    this to configure overlap length. It prepares outgoing PCM at the transition;
+     ``--audio-crossfade-buffer`` is not required for automatic mode.
+ 
+     The core prepares the next entry with the existing playlist prefetcher,
+@@ -2499,8 +2499,12 @@ Audio
+     The overlap is limited by decoded PCM, incoming decoder readiness, and
+     the 64 MiB outgoing reserve. A short incoming file shortens the overlap
+     without trimming the outgoing file's end. Online playback remains
+-    best-effort. Lookahead increases memory and buffering; changes to this
+-    option during playback reconfigure the audio output.
++    best-effort. Normal playback retains its ordinary output buffer so live
++    filter, pitch and speed controls do not wait behind an overlap's worth of
++    processed audio. Only a handoff temporarily expands the queue. Changing
++    the duration does not reopen the audio output.
++    If the outgoing duration is unknown, only audio already decoded at EOF
++    can be retained, so the overlap can be shorter than requested.
+ 
+ ``--audio-crossfade-curve=<linear|equal-power>``
+     Curve for automatic playlist overlaps (default: linear). Equal-power uses
+diff --git a/audio/out/ao.c b/audio/out/ao.c
+index cd6c35d09a..f239fc7c7b 100644
+--- a/audio/out/ao.c
++++ b/audio/out/ao.c
+@@ -153,7 +153,7 @@ const struct m_sub_options ao_conf = {
+         {"audio-crossfade-buffer", OPT_DOUBLE(audio_crossfade_buffer),
+             .flags = UPDATE_AUDIO, M_RANGE(0, 30)},
+         {"audio-crossfade-duration", OPT_DOUBLE(audio_crossfade_duration),
+-            .flags = UPDATE_AUDIO, M_RANGE(0, 30)},
++            M_RANGE(0, 30)},
+         {"audio-crossfade-curve", OPT_CHOICE(audio_crossfade_curve,
+             {"linear", 0}, {"equal-power", 1})},
+         {"audio-set-media-role", OPT_BOOL(audio_set_media_role),
+@@ -198,8 +198,7 @@ static struct ao *ao_alloc(bool probing, struct mpv_global *global,
+         .wakeup_ctx = wakeup_ctx,
+         .log = mp_log_new(ao, log, name),
+         .def_buffer = opts->audio_buffer,
+-        .crossfade_buffer = MPMAX(opts->audio_crossfade_buffer,
+-                                 opts->audio_crossfade_duration),
++        .crossfade_buffer = opts->audio_crossfade_buffer,
+         .client_name = talloc_strdup(ao, opts->audio_client_name),
+         .set_media_role = opts->audio_set_media_role
+     };
+diff --git a/audio/out/ao.h b/audio/out/ao.h
+index 43d9623753..b63126bdc9 100644
+--- a/audio/out/ao.h
++++ b/audio/out/ao.h
+@@ -120,6 +120,7 @@ double ao_crossfade_capture(struct ao *ao, double seconds, bool equal_power,
+ void ao_crossfade_commit(struct ao *ao, double max_seconds);
+ void ao_crossfade_clear_input(struct ao *ao);
+ struct ao_crossfade_state ao_get_crossfade(struct ao *ao);
++void ao_crossfade_reserve(struct ao *ao, double seconds);
+ double ao_get_delay(struct ao *ao);
+ void ao_reset(struct ao *ao);
+ void ao_start(struct ao *ao);
+diff --git a/audio/out/buffer.c b/audio/out/buffer.c
+index 0378b3e50b..09814ae552 100644
+--- a/audio/out/buffer.c
++++ b/audio/out/buffer.c
+@@ -258,6 +258,22 @@ static int read_buffer(struct ao *ao, void **data, int samples, bool *eof,
+     return pos;
+ }
+ 
++void ao_crossfade_reserve(struct ao *ao, double seconds)
++{
++    struct buffer_state *p = ao->buffer_state;
++    size_t frame_bytes = (size_t)ao->sstride * ao->num_planes;
++    int reserve = (int)MPMIN(seconds * ao->samplerate,
++                            AO_CROSSFADE_MAX_BYTES / frame_bytes);
++    struct mp_async_queue_config cfg = {
++        .sample_unit = AQUEUE_UNIT_SAMPLES,
++        .max_samples = MPMAX(ao->buffer, reserve),
++        .max_bytes = INT64_MAX,
++    };
++    // Changing capacity wakes the producer without dropping queued samples or
++    // rebuilding the device. Ordinary playback keeps its normal short buffer.
++    mp_async_queue_set_config(p->queue, cfg);
++}
++
+ struct ao_crossfade_state ao_get_crossfade(struct ao *ao)
+ {
+     struct buffer_state *p = ao->buffer_state;
+diff --git a/filters/f_async_queue.c b/filters/f_async_queue.c
+index 1d8199c289..afc72477ef 100644
+--- a/filters/f_async_queue.c
++++ b/filters/f_async_queue.c
+@@ -143,10 +143,13 @@ void mp_async_queue_set_config(struct mp_async_queue *queue,
+     cfg.max_samples = MPMAX(cfg.max_samples, 1);
+ 
+     mp_mutex_lock(&q->lock);
++    bool was_full = is_full(q);
+     bool recompute = q->cfg.sample_unit != cfg.sample_unit;
+     q->cfg = cfg;
+     if (recompute)
+         recompute_sizes(q);
++    if (was_full && !is_full(q) && q->conn[0])
++        mp_filter_wakeup(q->conn[0]);
+     mp_mutex_unlock(&q->lock);
+ }
+ 
+diff --git a/filters/f_lavfi.c b/filters/f_lavfi.c
+index 6b32d1d715..9396c0f20a 100644
+--- a/filters/f_lavfi.c
++++ b/filters/f_lavfi.c
+@@ -847,7 +847,7 @@ static bool read_output_pads(struct lavfi *c)
+     return progress;
+ }
+ 
+-static void reset_graph(struct lavfi *c);
++static void reset_graph(struct lavfi *c, bool new_stream);
+ 
+ static void lavfi_process(struct mp_filter *f)
+ {
+@@ -875,7 +875,7 @@ static void lavfi_process(struct mp_filter *f)
+             if (c->format_changed)
+                 free_graph(c);
+             else
+-                reset_graph(c);
++                reset_graph(c, false);
+             mp_filter_internal_mark_progress(c->f);
+         }
+     }
+@@ -884,11 +884,12 @@ static void lavfi_process(struct mp_filter *f)
+         mp_filter_internal_mark_failed(c->f);
+ }
+ 
+-static void reset_graph(struct lavfi *c)
++static void reset_graph(struct lavfi *c, bool new_stream)
+ {
+     if (!c->destroying && c->initialized &&
+-        avfilter_graph_reset(c->graph) >= 0) {
+-        MP_VERBOSE(c, "cleared audio history, retaining filter instances\n");
++        (new_stream ? avfilter_graph_new_stream(c->graph) : avfilter_graph_reset(c->graph)) >= 0) {
++        MP_VERBOSE(c, new_stream ? "continuing signal history for the next recording\n"
++                                : "cleared audio history, retaining filter instances\n");
+         c->draining_recover = false;
+         c->in_pts = MP_NOPTS_VALUE;
+         c->in_samples = 0;
+@@ -907,7 +908,7 @@ static void reset_graph(struct lavfi *c)
+ static void lavfi_reset(struct mp_filter *f)
+ {
+     struct lavfi *c = f->priv;
+-    reset_graph(c);
++    reset_graph(c, false);
+     for (int n = 0; n < c->num_in_pads; n++)
+         mp_frame_unref(&c->in_pads[n]->pending);
+ }
+@@ -921,6 +922,14 @@ static void lavfi_destroy(struct mp_filter *f)
+     av_frame_free(&c->tmp_frame);
+ }
+ 
++static void lavfi_new_stream(struct mp_filter *f)
++{
++    struct lavfi *c = f->priv;
++    reset_graph(c, true);
++    for (int n = 0; n < c->num_in_pads; n++)
++        mp_frame_unref(&c->in_pads[n]->pending);
++}
++
+ static bool lavfi_command(struct mp_filter *f, struct mp_filter_command *cmd)
+ {
+     struct lavfi *c = f->priv;
+@@ -952,6 +961,7 @@ static const struct mp_filter_info lavfi_filter = {
+     .priv_size = sizeof(struct lavfi),
+     .process = lavfi_process,
+     .reset = lavfi_reset,
++    .new_stream = lavfi_new_stream,
+     .destroy = lavfi_destroy,
+     .command = lavfi_command,
+ };
+diff --git a/filters/f_output_chain.c b/filters/f_output_chain.c
+index e42c7a112a..717fb49b9f 100644
+--- a/filters/f_output_chain.c
++++ b/filters/f_output_chain.c
+@@ -1,4 +1,5 @@
+ #include "audio/aframe.h"
++#include "audio/format.h"
+ #include "audio/out/ao.h"
+ #include "common/global.h"
+ #include "common/msg.h"
+@@ -43,6 +44,8 @@ struct chain {
+ 
+     struct mp_user_filter *input, *output, *convert_wrapper;
+     struct mp_autoconvert *convert;
++    struct mp_autoconvert *input_convert;
++    bool gapless;
+ 
+     // Enhancement-layer pair filter wrapper (tail of post_filters). NULL when
+     // no EL is paired.
+@@ -355,11 +358,34 @@ void mp_output_chain_reset_harder(struct mp_output_chain *c)
+     }
+ 
+     if (p->type == MP_OUTPUT_CHAIN_AUDIO) {
++        mp_autoconvert_clear(p->input_convert);
+         p->ao = NULL;
+         mp_autoconvert_clear(p->convert);
+     }
+ }
+ 
++void mp_output_chain_set_gapless(struct mp_output_chain *c, bool gapless)
++{
++    struct chain *p = c->f->priv;
++    if (p->gapless != gapless) {
++        p->gapless = gapless;
++        mp_autoconvert_clear(p->input_convert);
++    }
++}
++
++void mp_output_chain_new_stream(struct mp_output_chain *c)
++{
++    struct chain *p = c->f->priv;
++    mp_filter_new_stream(p->f);
++    p->public.failed_output_conversion = false;
++    for (int n = 0; n < p->num_all_filters; n++)
++        p->all_filters[n]->failed = false;
++    mp_autoconvert_clear(p->input_convert);
++    mp_aframe_reset(p->output->last_in_aformat);
++    p->ao = NULL;
++    mp_autoconvert_clear(p->convert);
++}
++
+ static void output_chain_destroy(struct mp_filter *f)
+ {
+     output_chain_reset(f);
+@@ -726,9 +752,38 @@ static void create_video_things(struct chain *p)
+     MP_TARRAY_APPEND(p, p->post_filters, p->num_post_filters, f);
+ }
+ 
++static void on_input_format_change(void *opaque)
++{
++    struct chain *p = opaque;
++    struct mp_aframe *src = p->input->last_in_aformat;
++
++    mp_autoconvert_clear(p->input_convert);
++    if (p->gapless && af_fmt_is_pcm(mp_aframe_get_format(src))) {
++        // A stable, lossless PCM representation prevents bit-depth changes
++        // from rebuilding the DSP graph. Rates and channels follow each source;
++        // pinning them to the first decoder could discard later track content.
++        mp_autoconvert_add_afmt(p->input_convert, AF_FORMAT_DOUBLEP);
++    }
++    mp_autoconvert_format_change_continue(p->input_convert);
++}
++
++static void create_audio_input(struct chain *p)
++{
++    struct mp_user_filter *u = create_wrapper_filter(p);
++    u->name = "input-format";
++    p->input_convert = mp_autoconvert_create(u->wrapper);
++    if (!p->input_convert)
++        abort();
++    u->f = p->input_convert->f;
++    p->input_convert->on_audio_format_change = on_input_format_change;
++    p->input_convert->on_audio_format_change_opaque = p;
++    MP_TARRAY_APPEND(p, p->pre_filters, p->num_pre_filters, u);
++}
++
+ static void create_audio_things(struct chain *p)
+ {
+     p->frame_type = MP_FRAME_AUDIO;
++    create_audio_input(p);
+ 
+     struct mp_user_filter *f = create_wrapper_filter(p);
+     f->name = "userspeed";
+diff --git a/filters/f_output_chain.h b/filters/f_output_chain.h
+index a9c0227783..10c0362af2 100644
+--- a/filters/f_output_chain.h
++++ b/filters/f_output_chain.h
+@@ -69,6 +69,13 @@ bool mp_output_chain_command(struct mp_output_chain *p, const char *target,
+ // filtering continues normally.
+ void mp_output_chain_reset_harder(struct mp_output_chain *p);
+ 
++// Normalize gapless PCM before effects without constraining source channels.
++void mp_output_chain_set_gapless(struct mp_output_chain *p, bool gapless);
++
++// Re-arm a drained chain for a natural recording boundary. Compatible DSP
++// signal history continues; per-recording analysis starts fresh.
++void mp_output_chain_new_stream(struct mp_output_chain *p);
++
+ // Try to exchange the filter list. If creation of any filter fails, roll
+ // back the changes, and return false.
+ struct m_obj_settings;
+diff --git a/filters/filter.c b/filters/filter.c
+index dfee5eeba2..3f177339a1 100644
+--- a/filters/filter.c
++++ b/filters/filter.c
+@@ -591,13 +591,13 @@ static void reset_pin(struct mp_pin *p)
+     p->data_requested = false;
+ }
+ 
+-void mp_filter_reset(struct mp_filter *filter)
++static void reset_filter(struct mp_filter *filter, bool new_stream, struct mp_filter *keep)
+ {
+-    if (!filter)
++    if (!filter || filter == keep)
+         return;
+ 
+     for (int n = 0; n < filter->in->num_children; n++)
+-        mp_filter_reset(filter->in->children[n]);
++        reset_filter(filter->in->children[n], new_stream, keep);
+ 
+     for (int n = 0; n < filter->num_pins; n++) {
+         struct mp_pin *p = filter->ppins[n];
+@@ -605,10 +605,27 @@ void mp_filter_reset(struct mp_filter *filter)
+         reset_pin(p->other);
+     }
+ 
+-    if (filter->in->info->reset)
++    if (new_stream && filter->in->info->new_stream)
++        filter->in->info->new_stream(filter);
++    else if (filter->in->info->reset)
+         filter->in->info->reset(filter);
+ }
+ 
++void mp_filter_reset(struct mp_filter *filter)
++{
++    reset_filter(filter, false, NULL);
++}
++
++void mp_filter_reset_except(struct mp_filter *filter, struct mp_filter *keep)
++{
++    reset_filter(filter, false, keep);
++}
++
++void mp_filter_new_stream(struct mp_filter *filter)
++{
++    reset_filter(filter, true, NULL);
++}
++
+ struct mp_pin *mp_filter_add_pin(struct mp_filter *f, enum mp_pin_dir dir,
+                                  const char *name)
+ {
+diff --git a/filters/filter.h b/filters/filter.h
+index 5bf1e48a84..85cb55f39c 100644
+--- a/filters/filter.h
++++ b/filters/filter.h
+@@ -365,6 +365,14 @@ bool mp_filter_has_failed(struct mp_filter *filter);
+ // other filters connected via pins).
+ void mp_filter_reset(struct mp_filter *filter);
+ 
++// Reset the graph except for a parked subtree whose EOF has already been
++// re-armed for a compatible next recording.
++void mp_filter_reset_except(struct mp_filter *filter, struct mp_filter *keep);
++
++// Re-arm a drained recording boundary. Stateful filters may retain signal
++// history through mp_filter_info.new_stream; other filters use reset.
++void mp_filter_new_stream(struct mp_filter *filter);
++
+ enum mp_filter_command_type {
+     MP_FILTER_COMMAND_TEXT = 1,
+     MP_FILTER_COMMAND_GET_META,
+diff --git a/filters/filter_internal.h b/filters/filter_internal.h
+index 9cabef727f..2d772fc74f 100644
+--- a/filters/filter_internal.h
++++ b/filters/filter_internal.h
+@@ -95,6 +95,10 @@ struct mp_filter_info {
+     // don't access pins.
+     void (*reset)(struct mp_filter *f);
+ 
++    // Re-arm a drained stream while preserving signal history for a
++    // compatible recording. NULL uses reset().
++    void (*new_stream)(struct mp_filter *f);
++
+     // Send a command to the filter. Highly implementation specific, usually
+     // user-initiated. Optional.
+     bool (*command)(struct mp_filter *f, struct mp_filter_command *cmd);
+diff --git a/player/audio.c b/player/audio.c
+index 5b6e47a72e..780818469e 100644
+--- a/player/audio.c
++++ b/player/audio.c
+@@ -501,7 +501,14 @@ static void ao_chain_uninit(struct ao_chain *ao_c)
+     if (mpctx->saved_audio_filters)
+         talloc_free(mpctx->saved_audio_filters->f);
+     mpctx->saved_audio_filters = ao_c->filter;
+-    mp_output_chain_reset_harder(ao_c->filter);
++    struct playlist_entry *next = mp_next_file(mpctx, 1, false, false);
++    mpctx->saved_audio_filter_entry_id = 0;
++    if (mpctx->stop_play == AT_END_OF_FILE && mpctx->opts->gapless_audio && next) {
++        mpctx->saved_audio_filter_entry_id = next->id;
++        mp_output_chain_new_stream(ao_c->filter);
++    } else {
++        mp_output_chain_reset_harder(ao_c->filter);
++    }
+     talloc_free(ao_c->ao_filter);
+     talloc_free(ao_c);
+ }
+@@ -629,7 +636,11 @@ static int reinit_audio_filters_and_output(struct MPContext *mpctx)
+     // Weak gapless audio: if the filter output format is the same as the
+     // previous one, keep the AO and don't reinit anything.
+     // Strong gapless: always keep the AO
+-    if ((mpctx->ao_filter_fmt && mpctx->ao && opts->gapless_audio < 0 &&
++    // A filter format change inside the same track is not a file transition.
++    // Convert to the running device instead of discarding its unplayed PCM.
++    if ((ao_c->ao && ao_c->ao == mpctx->ao && crossfade_pcm &&
++         ao_can_fade(mpctx->ao) && !mpctx->encode_lavc_ctx) ||
++        (mpctx->ao_filter_fmt && mpctx->ao && opts->gapless_audio < 0 &&
+          keep_weak_gapless_format(mpctx->ao_filter_fmt, out_fmt)) ||
+         (mpctx->ao && opts->gapless_audio > 0) ||
+         (mpctx->ao && mpctx->audio_crossfade_entry_id &&
+@@ -864,6 +875,10 @@ void reinit_audio_chain_src(struct MPContext *mpctx, struct track *track)
+     ao_c->log = mpctx->log;
+     ao_c->filter = mpctx->saved_audio_filters;
+     mpctx->saved_audio_filters = NULL;
++    if (ao_c->filter && mpctx->saved_audio_filter_entry_id &&
++        (!mpctx->playing || mpctx->playing->id != mpctx->saved_audio_filter_entry_id))
++        mp_output_chain_reset_harder(ao_c->filter);
++    mpctx->saved_audio_filter_entry_id = 0;
+     if (!ao_c->filter)
+         ao_c->filter = mp_output_chain_create(mpctx->filter_root, MP_OUTPUT_CHAIN_AUDIO);
+     ao_c->spdif_passthrough = true;
+@@ -873,6 +888,7 @@ void reinit_audio_chain_src(struct MPContext *mpctx, struct track *track)
+     ao_c->ao_filter = mp_filter_create(mpctx->filter_root, &ao_filter);
+     if (!ao_c->filter || !ao_c->ao_filter)
+         goto init_error;
++    mp_output_chain_set_gapless(ao_c->filter, mpctx->opts->gapless_audio != 0);
+     ao_c->ao_filter->priv = ao_c;
+ 
+     mp_filter_add_pin(ao_c->ao_filter, MP_PIN_IN, "in");
+@@ -965,7 +981,8 @@ static void ao_process(struct mp_filter *f)
+     // Due to mp_async_queue_set_notifier() this function is called when the
+     // queue becomes full. This affects state changes in the normal playloop,
+     // so wake it up. But avoid redundant wakeups during normal playback.
+-    if (mpctx->audio_status != STATUS_PLAYING &&
++    if ((mpctx->audio_status != STATUS_PLAYING ||
++         mpctx->audio_crossfade_prepare.command) &&
+         mp_async_queue_is_full(ao_c->ao_queue))
+         mp_wakeup_core(mpctx);
+ 
+@@ -1167,23 +1184,53 @@ static bool automatic_crossfade_enabled(struct MPContext *mpctx)
+ 
+ void audio_crossfade_update(struct MPContext *mpctx)
+ {
++    if (mp_crossfade_load_update(mpctx))
++        return;
++
+     if (!automatic_crossfade_enabled(mpctx) || !mpctx->restart_complete ||
+         get_internal_paused(mpctx) || audio_fade_paused(mpctx) || mpctx->seek.type ||
+-        mpctx->audio_fade_action != AUDIO_FADE_NONE || mpctx->audio_crossfade_entry_id)
++        mpctx->audio_fade_action != AUDIO_FADE_NONE || mpctx->audio_crossfade_entry_id) {
++        if (mpctx->ao)
++            ao_crossfade_reserve(mpctx->ao, 0);
+         return;
++    }
+ 
+     // Reuse mpv's demux prefetcher as soon as a successor is queued. The
+     // incoming decoder is opened while retained outgoing PCM is playing.
+     prefetch_next(mpctx);
++    struct ao_crossfade_state state = ao_get_crossfade(mpctx->ao);
++    if (!state.supported || state.active || ao_get_fade(mpctx->ao).active) {
++        ao_crossfade_reserve(mpctx->ao, 0);
++        return;
++    }
++    struct playlist_entry *preview = mp_next_file(mpctx, 1, false, false);
++    if (preview && mpctx->open_active && mpctx->open_for_prefetch &&
++        atomic_load(&mpctx->open_done) && !mpctx->open_res_demuxer &&
++        strcmp(mpctx->open_url, preview->filename) == 0) {
++        ao_crossfade_reserve(mpctx->ao, 0);
++        return; // let ordinary EOF retry an unavailable successor
++    }
++    double seconds = MPMIN(mpctx->opts->ao_opts->audio_crossfade_duration, state.capacity);
++    double length = get_time_length(mpctx);
++    double position = playing_audio_pts(mpctx);
++    if (length > 0 && position != MP_NOPTS_VALUE) {
++        double remaining = (length - position) / mpctx->audio_speed;
++        if (remaining > seconds) {
++            ao_crossfade_reserve(mpctx->ao, 0);
++            mp_set_timeout(mpctx, remaining - seconds);
++            return;
++        }
++        // Decode the outgoing tail only when its overlap is due. Reserving
++        // post-filter PCM throughout a track delays every live DSP control.
++        ao_crossfade_reserve(mpctx->ao, seconds);
++    }
+     if (!mpctx->ao_chain->out_eof || !mpctx->ao_chain->ao_queue ||
+         !mp_async_queue_has_eof(mpctx->ao_chain->ao_queue))
+         return;
+ 
+-    struct ao_crossfade_state state = ao_get_crossfade(mpctx->ao);
+-    if (!state.supported || state.active || state.available <= 0 ||
+-        ao_get_fade(mpctx->ao).active)
++    state = ao_get_crossfade(mpctx->ao);
++    if (state.available <= 0)
+         return;
+-    double seconds = MPMIN(mpctx->opts->ao_opts->audio_crossfade_duration, state.capacity);
+     if (state.available > seconds) {
+         // A caller may have configured a larger ordinary audio buffer. Wait
+         // for the final overlap window without polling a clock in the client.
+@@ -1191,14 +1238,9 @@ void audio_crossfade_update(struct MPContext *mpctx)
+         return;
+     }
+ 
+-    struct playlist_entry *preview = mp_next_file(mpctx, 1, false, false);
+-    if (preview && mpctx->open_active && mpctx->open_for_prefetch &&
+-        atomic_load(&mpctx->open_done) && !mpctx->open_res_demuxer &&
+-        strcmp(mpctx->open_url, preview->filename) == 0)
+-        return; // let ordinary EOF retry an unavailable successor
+-
+     double captured = ao_crossfade_capture(mpctx->ao, seconds,
+         mpctx->opts->ao_opts->audio_crossfade_curve != 0, true);
++    ao_crossfade_reserve(mpctx->ao, 0);
+     if (captured <= 0)
+         return;
+     struct playlist_entry *next = mp_next_file(mpctx, 1, false, true);
+@@ -1342,6 +1384,7 @@ bool audio_crossfade_handoff(struct MPContext *mpctx)
+ // Drop data queued for output, or which the AO is currently outputting.
+ void clear_audio_output_buffers(struct MPContext *mpctx)
+ {
++    mp_crossfade_load_cancel(mpctx);
+     if (mpctx->ao && mpctx->audio_crossfade_entry_id && mpctx->playing &&
+         mpctx->playing->id == mpctx->audio_crossfade_entry_id && !mpctx->restart_complete &&
+         !mpctx->stop_play) {
+diff --git a/player/command.c b/player/command.c
+index 7974a1ff92..b65c8bc660 100644
+--- a/player/command.c
++++ b/player/command.c
+@@ -6672,15 +6672,10 @@ static void cmd_loadfile(void *p)
+     mp_wakeup_core(mpctx);
+ }
+ 
+-static void cmd_crossfade_loadfile(void *p)
++static void finish_crossfade_loadfile(struct mp_cmd_ctx *cmd)
+ {
+-    struct mp_cmd_ctx *cmd = p;
+     MPContext *mpctx = cmd->mpctx;
+     double seconds = cmd->args[1].v.d;
+-    if (!isfinite(seconds)) {
+-        cmd->success = false;
+-        return;
+-    }
+     if (mpctx->opts->position_save_on_quit)
+         mp_write_watch_later_conf(mpctx);
+     char *path = mp_get_user_path(NULL, mpctx->global, cmd->args[0].v.s);
+@@ -6708,6 +6703,79 @@ static void cmd_crossfade_loadfile(void *p)
+     mp_wakeup_core(mpctx);
+ }
+ 
++void mp_crossfade_load_cancel(struct MPContext *mpctx)
++{
++    struct mp_cmd_ctx *cmd = mpctx->audio_crossfade_prepare.command;
++    mpctx->audio_crossfade_prepare.command = NULL;
++    if (mpctx->ao)
++        ao_crossfade_reserve(mpctx->ao, 0);
++    if (cmd) {
++        cmd->success = false;
++        mp_cmd_ctx_complete(cmd);
++    }
++}
++
++bool mp_crossfade_load_update(struct MPContext *mpctx)
++{
++    struct mp_cmd_ctx *cmd = mpctx->audio_crossfade_prepare.command;
++    if (!cmd)
++        return false;
++    if (mpctx->stop_play || mpctx->seek.type || !mpctx->playing ||
++        mpctx->playing->id != mpctx->audio_crossfade_prepare.entry_id) {
++        mp_crossfade_load_cancel(mpctx);
++        return true;
++    }
++
++    int64_t deadline = mpctx->audio_crossfade_prepare.deadline_ns;
++    if (mpctx->ao && mpctx->ao_chain && !get_internal_paused(mpctx) &&
++        !mpctx->ao_chain->out_eof && mp_time_ns() < deadline) {
++        struct ao_crossfade_state state = ao_get_crossfade(mpctx->ao);
++        if (state.supported && !state.active &&
++            state.available < MPMIN(cmd->args[1].v.d, state.capacity)) {
++            mp_set_timeout(mpctx, MP_TIME_NS_TO_S(deadline - mp_time_ns()));
++            return true;
++        }
++    }
++    mpctx->audio_crossfade_prepare.command = NULL;
++    if (mpctx->ao)
++        ao_crossfade_reserve(mpctx->ao, 0);
++    finish_crossfade_loadfile(cmd);
++    mp_cmd_ctx_complete(cmd);
++    return true;
++}
++
++static void cmd_crossfade_loadfile(void *p)
++{
++    struct mp_cmd_ctx *cmd = p;
++    struct MPContext *mpctx = cmd->mpctx;
++    double seconds = cmd->args[1].v.d;
++    mp_crossfade_load_cancel(mpctx);
++    if (!isfinite(seconds)) {
++        cmd->success = false;
++        mp_cmd_ctx_complete(cmd);
++        return;
++    }
++    if (seconds > 0 && mpctx->ao && mpctx->ao_chain && mpctx->playing &&
++        !get_internal_paused(mpctx) && !mpctx->encode_lavc_ctx) {
++        struct ao_crossfade_state state = ao_get_crossfade(mpctx->ao);
++        if (state.supported && !state.active && !mpctx->ao_chain->out_eof &&
++            state.available < MPMIN(seconds, state.capacity)) {
++            mpctx->audio_crossfade_prepare.command = cmd;
++            mpctx->audio_crossfade_prepare.entry_id = mpctx->playing->id;
++            // Fill on the existing producer loop, never by blocking the core.
++            // A slow/network source gets a shorter best-effort overlap instead
++            // of holding a navigation command indefinitely.
++            mpctx->audio_crossfade_prepare.deadline_ns = mp_time_ns() + INT64_C(250000000);
++            ao_crossfade_reserve(mpctx->ao, seconds);
++            mp_set_timeout(mpctx, 0.25);
++            mp_wakeup_core(mpctx);
++            return;
++        }
++    }
++    finish_crossfade_loadfile(cmd);
++    mp_cmd_ctx_complete(cmd);
++}
++
+ static void cmd_loadlist(void *p)
+ {
+     struct mp_cmd_ctx *cmd = p;
+@@ -7777,6 +7845,7 @@ const struct mp_cmd_def mp_cmds[] = {
+                 OPTDEF_INT(0)},
+             {"options", OPT_KEYVALUELIST(v.str_list), .flags = MP_CMD_OPT_ARG},
+         },
++        .exec_async = true,
+     },
+     { "fade-play", cmd_fade_play,
+         { {"duration", OPT_DOUBLE(v.d), M_RANGE(0, 60)} },
+@@ -8352,6 +8421,7 @@ const struct mp_cmd_def mp_cmds[] = {
+ 
+ void command_uninit(struct MPContext *mpctx)
+ {
++    mp_crossfade_load_cancel(mpctx);
+     struct command_ctx *ctx = mpctx->command_ctx;
+ 
+     mp_assert(!ctx->cache_dump_cmd); // closing the demuxer must have aborted it
+diff --git a/player/command.h b/player/command.h
+index 33153b07dd..73ffa1caee 100644
+--- a/player/command.h
++++ b/player/command.h
+@@ -77,6 +77,8 @@ void run_command(struct MPContext *mpctx, struct mp_cmd *cmd,
+                  void *on_completion_priv);
+ void run_command_opts(struct MPContext *mpctx);
+ void mp_cmd_ctx_complete(struct mp_cmd_ctx *cmd);
++bool mp_crossfade_load_update(struct MPContext *mpctx);
++void mp_crossfade_load_cancel(struct MPContext *mpctx);
+ MP_PRINTF_ATTRIBUTE(3, 4)
+ void mp_cmd_msg(struct mp_cmd_ctx *cmd, int status, const char *msg, ...);
+ char *mp_property_expand_string(struct MPContext *mpctx, const char *str);
+diff --git a/player/core.h b/player/core.h
+index 5339b7f5de..5ebd076700 100644
+--- a/player/core.h
++++ b/player/core.h
+@@ -344,6 +344,7 @@ typedef struct MPContext {
+     struct ao_chain *ao_chain;
+     // Decoder-independent user processing retained between compatible files.
+     struct mp_output_chain *saved_audio_filters;
++    int64_t saved_audio_filter_entry_id;
+ 
+     // Persist the requested envelope when the audio device is recreated.
+     bool audio_fade_set;
+@@ -355,6 +356,10 @@ typedef struct MPContext {
+     double audio_fade_seek_target;
+     int64_t audio_crossfade_entry_id;
+     int64_t audio_crossfade_auto_from;
++    struct {
++        struct mp_cmd_ctx *command;
++        int64_t deadline_ns, entry_id;
++    } audio_crossfade_prepare;
+ 
+     struct vo_chain *vo_chain;
+ 
+diff --git a/player/main.c b/player/main.c
+index 62610afb04..3a693dd877 100644
+--- a/player/main.c
++++ b/player/main.c
+@@ -184,6 +184,7 @@ void mp_destroy(struct MPContext *mpctx)
+ 
+     TA_FREEP(&mpctx->filter_root);
+     mpctx->saved_audio_filters = NULL;
++    mpctx->saved_audio_filter_entry_id = 0;
+     uninit_audio_out(mpctx);
+     uninit_video_out(mpctx);
+ 
+diff --git a/player/playloop.c b/player/playloop.c
+index b8de142b17..4b34d0a145 100644
+--- a/player/playloop.c
++++ b/player/playloop.c
+@@ -243,7 +243,14 @@ void step_frame_mute(struct MPContext *mpctx, bool mute)
+ // Clear some playback-related fields on file loading or after seeks.
+ void reset_playback_state(struct MPContext *mpctx)
+ {
+-    mp_filter_reset(mpctx->filter_root);
++    struct mp_filter *keep = NULL;
++    if (mpctx->saved_audio_filters && mpctx->saved_audio_filter_entry_id &&
++        mpctx->playlist->current &&
++        mpctx->playlist->current->id == mpctx->saved_audio_filter_entry_id)
++        keep = mpctx->saved_audio_filters->f;
++    // The natural boundary already re-armed this chain. The ordinary loading
++    // reset must not immediately erase its retained signal history again.
++    mp_filter_reset_except(mpctx->filter_root, keep);
+ 
+     reset_video_state(mpctx);
+     reset_audio_state(mpctx);
