@@ -431,8 +431,6 @@ jobs:
           for patch in ../patch/*.patch; do
             apply-required-patch "$patch"
           done
-          apply-required-patch ../update-openssl.patch
-          apply-required-patch ../fix-ffmpeg-opengl.patch
           apply-required-patch ../compile-library-mpv.patch
           variant='${{ matrix.variant }}'
           if [[ "$variant" == lgpl* ]]; then

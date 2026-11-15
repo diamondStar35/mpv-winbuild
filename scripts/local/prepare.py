@@ -6,7 +6,7 @@ from pathlib import Path
 import subprocess
 import sys
 
-UPSTREAM = '1f8d2e76255abc48f0456d9be99b4cab9c6566e6'
+UPSTREAM = '7e36e1eab5094a642c5a3c1771551f06b5ec3224'
 
 
 def run(*args, cwd=None):
@@ -18,7 +18,6 @@ def main():
     recipe = workspace / 'recipes'
     patches = [repo / 'patch_pr/0000-mpv-add-patch.patch',
                *sorted((repo / 'patch').glob('*.patch')),
-               repo / 'update-openssl.patch', repo / 'fix-ffmpeg-opengl.patch',
                repo / 'compile-library-mpv.patch', repo / 'build-shared-ffmpeg.patch',
                repo / 'enable-ffmpeg-source-patches.patch']
     native_patches = [*sorted((repo / 'mpv-patches').glob('mpv-*.patch')),

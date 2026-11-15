@@ -85,7 +85,7 @@ source edits; rebuild MPV afterward if FFmpeg's ABI changes. Logs are appended
 under `/home/diamond/mpv-build/logs`. Upstream ExternalProject failure details
 are in `build64-v2/**/src/*-stamp/*-err.log` and `*-out.log`.
 
-Recipes start at upstream commit `1f8d2e76255abc48f0456d9be99b4cab9c6566e6`
+Recipes start at upstream commit `7e36e1eab5094a642c5a3c1771551f06b5ec3224`
 and keep their own Git history. `prepare` validates recipe fingerprints and
 regenerates CMake wrappers; routine `mpv` builds do not reconfigure everything.
 Native patches are a snapshot taken during initial setup. Later edits to patch
