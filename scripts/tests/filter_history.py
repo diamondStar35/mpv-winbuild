@@ -189,13 +189,17 @@ class LiveControlTests(unittest.TestCase):
             player.pump()
             time.sleep(0.005)
 
-    def start(self, crossfade, graph=''):
+    def start(self, crossfade, graph='', output_format='float', media=None):
         player = Player(LIBRARY, graph)
         # In-track controls must preserve output even when gapless file
         # transitions are disabled.
         player.command('set', 'gapless-audio', 'no')
         player.command('set', 'audio-crossfade-duration', crossfade)
-        player.command('loadfile', str(self.media))
+        # Model the fixed floating-point output used by a Windows shared mixer.
+        # Precision-upgrade tests leave this unset to exercise renegotiation.
+        if output_format:
+            player.command('set', 'audio-format', output_format)
+        player.command('loadfile', str(media or self.media))
         player.restart()
         self.pump(player, 0.2)
         return player
@@ -264,6 +268,47 @@ class LiveControlTests(unittest.TestCase):
                 def pitch():
                     player.command('set', 'pitch', 2 ** (1 / 12))
                 self.assert_continuous(player, pitch)
+
+    def test_required_precision_upgrade_drains_without_skipping(self):
+        with self.start(0, output_format=None) as player:
+            self.assertEqual(player.get_property('audio-out-params/format'), 's16')
+            before = float(player.get_property('audio-pts'))
+            started = time.perf_counter()
+            player.command('set', 'pitch', 2 ** (1 / 12))
+            self.pump(player, 0.9)
+            advanced = float(player.get_property('audio-pts')) - before
+            elapsed = time.perf_counter() - started
+            self.assertLess(abs(advanced - elapsed), 0.2,
+                            'Renegotiating a higher-precision output discarded unplayed samples')
+            self.assertIn(player.get_property('audio-out-params/format'), ['float', 'floatp', 'double', 'doublep'])
+
+    def test_lossless_conversion_keeps_higher_precision_output(self):
+        with self.start(0, '@precision:lavfi=[aformat=sample_fmts=dblp]', output_format=None) as player:
+            self.assertEqual(player.get_property('audio-out-params/format'), 'doublep')
+            self.assert_continuous(player, lambda: player.command('af', 'remove', '@precision'))
+            self.assertEqual(player.get_property('audio-out-params/format'), 'doublep')
+
+    def test_channel_expansion_is_not_downmixed_by_gapless_policy(self):
+        stereo = Path('live-stereo.wav').resolve()
+        with wave.open(str(stereo), 'wb') as output:
+            output.setnchannels(2)
+            output.setsampwidth(2)
+            output.setframerate(48000)
+            output.writeframes(b''.join(struct.pack('<hh', sample, -sample)
+                                       for sample in range(-2000, 2000)) * 180)
+        for gapless in ['no', 'weak', 'yes']:
+            with self.subTest(gapless=gapless), self.start(0, '@mono:lavfi=[pan=mono|c0=c0]', media=stereo) as player:
+                player.command('set', 'gapless-audio', gapless)
+                self.assertEqual(player.get_property('audio-out-params/channel-count'), '1')
+                before = float(player.get_property('audio-pts'))
+                started = time.perf_counter()
+                player.command('af', 'remove', '@mono')
+                self.pump(player, 0.9)
+                self.assertEqual(player.get_property('audio-out-params/channel-count'), '2',
+                                 'A live stereo signal was forced through the old mono output')
+                advanced = float(player.get_property('audio-pts')) - before
+                self.assertLess(abs(advanced - (time.perf_counter() - started)), 0.2,
+                                'Changing the channel layout discarded unplayed samples')
 
     def test_explicit_output_changes_still_reconfigure_device(self):
         with self.start(0) as player:

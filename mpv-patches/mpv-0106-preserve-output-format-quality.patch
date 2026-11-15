@@ -1,0 +1,181 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: diamondStar35 <ramymaherali55@gmail.com>
+Date: Mon, 16 Nov 2026 00:10:51 +0200
+Subject: [PATCH] audio: retain shared output without avoidable format loss
+
+Reuse a shared mixer stream when reopening would select the same rate and
+sample format and its channel request is compatible. For other backends,
+retain the stream only when conversion preserves rate, channels and sample
+precision. File gapless policy must not bypass this in-track decision.
+
+Drain queued PCM asynchronously before a genuine output format change.
+Keep 64-bit integer input intact through gapless preparation rather than
+rounding it through floating point.
+---
+diff --git a/DOCS/interface-changes/audio-filter-history-reset.txt b/DOCS/interface-changes/audio-filter-history-reset.txt
+index 761631b3d3..45bec6f8f0 100644
+--- a/DOCS/interface-changes/audio-filter-history-reset.txt
++++ b/DOCS/interface-changes/audio-filter-history-reset.txt
+@@ -4,3 +4,6 @@ audio-filter-history-reset property reports support for this lifecycle.
+ Natural gapless boundaries continue compatible signal history while restarting
+ per-recording analysis. A stable PCM sample representation before effects
+ preserves precision without forcing the first decoder's rate or channels.
++Live shared-mixer output reuse retains the mixer's negotiated rate and sample
++format. New channel requirements are renegotiated; other outputs are reused
++only when conversion preserves rate, channels and sample precision.
+diff --git a/audio/out/ao.c b/audio/out/ao.c
+index f239fc7c7b..64c07e729f 100644
+--- a/audio/out/ao.c
++++ b/audio/out/ao.c
+@@ -227,6 +227,7 @@ static struct ao *ao_init(bool probing, struct mpv_global *global,
+         return NULL;
+     ao->samplerate = samplerate;
+     ao->channels = channels;
++    ao->requested_channels = channels;
+     ao->format = format;
+     ao->encode_lavc_ctx = encode_lavc_ctx;
+     ao->init_flags = flags;
+@@ -463,6 +464,28 @@ void ao_get_format(struct ao *ao,
+     *channels = ao->channels;
+ }
+ 
++bool ao_can_reuse_pcm_format(struct ao *ao, int rate, int format,
++                              struct mp_chmap *channels)
++{
++    if (!(af_fmt_is_int(format) || af_fmt_is_float(format)) ||
++        !(af_fmt_is_int(ao->format) || af_fmt_is_float(ao->format)))
++        return false;
++
++    bool same_layout = mp_chmap_equals_reordered(channels, &ao->channels);
++    if (ao->format_from_mixer) {
++        // Reopening a shared mixer stream selects the same rate and sample
++        // format. Reuse only channel requests already known to fit this stream.
++        return same_layout ||
++            mp_chmap_equals_reordered(channels, &ao->requested_channels);
++    }
++
++    // Other outputs may negotiate a better format when reopened. Keep them
++    // only if no rate, channel or sample-precision reduction is required.
++    bool to_integer = af_fmt_is_float(format) && !af_fmt_is_float(ao->format);
++    return same_layout && rate == ao->samplerate && !to_integer &&
++        af_format_conversion_score(ao->format, format) >= 0;
++}
++
+ const char *ao_get_name(struct ao *ao)
+ {
+     return ao->driver->name;
+diff --git a/audio/out/ao.h b/audio/out/ao.h
+index b63126bdc9..482db07983 100644
+--- a/audio/out/ao.h
++++ b/audio/out/ao.h
+@@ -93,6 +93,10 @@ struct ao *ao_init_best(struct mpv_global *global,
+ void ao_uninit(struct ao *ao);
+ void ao_get_format(struct ao *ao,
+                    int *samplerate, int *format, struct mp_chmap *channels);
++// Whether a live PCM change can retain the negotiated output without an
++// additional format downgrade compared with reopening the backend.
++bool ao_can_reuse_pcm_format(struct ao *ao, int rate, int format,
++                              struct mp_chmap *channels);
+ const char *ao_get_name(struct ao *ao);
+ const char *ao_get_description(struct ao *ao);
+ bool ao_untimed(struct ao *ao);
+diff --git a/audio/out/ao_wasapi_utils.c b/audio/out/ao_wasapi_utils.c
+index 8914e3e0c3..94c5d29570 100644
+--- a/audio/out/ao_wasapi_utils.c
++++ b/audio/out/ao_wasapi_utils.c
+@@ -364,6 +364,7 @@ static bool set_ao_format(struct ao *ao, WAVEFORMATEX *wf,
+     }
+     waveformat_copy(&state->format, wf);
+     state->share_mode = share_mode;
++    ao->format_from_mixer = share_mode == AUDCLNT_SHAREMODE_SHARED;
+ 
+     MP_VERBOSE(ao, "Accepted as %s %s @ %dhz -> %s (%s)\n",
+                mp_chmap_to_str(&ao->channels),
+diff --git a/audio/out/internal.h b/audio/out/internal.h
+index 48721d4e3c..a191a876e8 100644
+--- a/audio/out/internal.h
++++ b/audio/out/internal.h
+@@ -31,6 +31,11 @@ struct ao {
+     int samplerate;
+     struct mp_chmap channels;
+     int format;                 // one of AF_FORMAT_...
++    // The channel request before the backend negotiated its actual layout.
++    struct mp_chmap requested_channels;
++    // The system mixer fixes the stream's sample rate and sample format.
++    // Its channel layout can still depend on the request.
++    bool format_from_mixer;
+     int64_t bps;                // bytes per second (per plane)
+     int sstride;                // size of a sample on each plane
+                                 // (format_size*num_channels/num_planes)
+diff --git a/filters/f_output_chain.c b/filters/f_output_chain.c
+index 717fb49b9f..9acdb63296 100644
+--- a/filters/f_output_chain.c
++++ b/filters/f_output_chain.c
+@@ -758,10 +758,13 @@ static void on_input_format_change(void *opaque)
+     struct mp_aframe *src = p->input->last_in_aformat;
+ 
+     mp_autoconvert_clear(p->input_convert);
+-    if (p->gapless && af_fmt_is_pcm(mp_aframe_get_format(src))) {
++    int format = mp_aframe_get_format(src);
++    if (p->gapless && (af_fmt_is_int(format) || af_fmt_is_float(format)) &&
++        af_format_conversion_score(AF_FORMAT_DOUBLEP, format) >= 0) {
+         // A stable, lossless PCM representation prevents bit-depth changes
+         // from rebuilding the DSP graph. Rates and channels follow each source;
+         // pinning them to the first decoder could discard later track content.
++        // Keep 64-bit integer PCM intact rather than rounding it through double.
+         mp_autoconvert_add_afmt(p->input_convert, AF_FORMAT_DOUBLEP);
+     }
+     mp_autoconvert_format_change_continue(p->input_convert);
+diff --git a/player/audio.c b/player/audio.c
+index 780818469e..391ad898b8 100644
+--- a/player/audio.c
++++ b/player/audio.c
+@@ -632,25 +632,43 @@ static int reinit_audio_filters_and_output(struct MPContext *mpctx)
+         mpctx->audio_crossfade_entry_id = 0;
+         uninit_audio_out(mpctx);
+     }
++    bool in_track = ao_c->ao && ao_c->ao == mpctx->ao;
++    struct mp_chmap requested_channels = {0};
++    mp_aframe_get_chmap(out_fmt, &requested_channels);
++    bool reuse_live = in_track && crossfade_pcm && !mpctx->encode_lavc_ctx &&
++        ao_can_reuse_pcm_format(mpctx->ao, mp_aframe_get_rate(out_fmt),
++                               mp_aframe_get_format(out_fmt), &requested_channels);
+ 
+     // Weak gapless audio: if the filter output format is the same as the
+     // previous one, keep the AO and don't reinit anything.
+     // Strong gapless: always keep the AO
+-    // A filter format change inside the same track is not a file transition.
+-    // Convert to the running device instead of discarding its unplayed PCM.
+-    if ((ao_c->ao && ao_c->ao == mpctx->ao && crossfade_pcm &&
+-         ao_can_fade(mpctx->ao) && !mpctx->encode_lavc_ctx) ||
++    // File-transition gapless policy must not bypass live format compatibility.
++    if (reuse_live || (!in_track && (
+         (mpctx->ao_filter_fmt && mpctx->ao && opts->gapless_audio < 0 &&
+          keep_weak_gapless_format(mpctx->ao_filter_fmt, out_fmt)) ||
+         (mpctx->ao && opts->gapless_audio > 0) ||
+         (mpctx->ao && mpctx->audio_crossfade_entry_id &&
+-         ao_can_fade(mpctx->ao) && crossfade_pcm))
++         ao_can_fade(mpctx->ao) && crossfade_pcm))))
+     {
+         ao_chain_set_ao(ao_c, mpctx->ao);
+         talloc_free(out_fmt);
+         return 0;
+     }
+ 
++    bool pending_pcm = in_track && (
++        mp_pin_out_has_data(ao_c->ao_filter->ppins[0]) ||
++        (ao_c->queue_filter && mp_pin_out_has_data(ao_c->queue_filter->ppins[0])));
++    if (in_track && !mpctx->encode_lavc_ctx &&
++        (pending_pcm || ao_get_delay(mpctx->ao) > 0)) {
++        // A real format change must not discard queued output. Leave the
++        // converter blocked while the old stream drains on its normal thread.
++        // Paused playback resumes this preparation when the user plays again.
++        if (!get_internal_paused(mpctx))
++            mp_set_timeout(mpctx, MPMAX(0.001, ao_get_delay(mpctx->ao)));
++        talloc_free(out_fmt);
++        return 0;
++    }
++
+     // Format change during syncing. Force playback start early, then wait.
+     if (ao_c->ao_queue && mp_async_queue_get_frames(ao_c->ao_queue) &&
+         mpctx->audio_status == STATUS_SYNCING)
