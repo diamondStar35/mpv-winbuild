@@ -1,0 +1,25 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: diamondStar35 <ramymaherali55@gmail.com>
+Date: Sun, 15 Nov 2026 23:00:00 +0200
+Subject: [PATCH] curl: reset restored sources before applying dependency patches
+
+The shared source cache can contain curl with the SCP header patch already
+committed, while a new build profile has no matching patch-step stamp.
+Prepare the upstream checkout before git am so replay is deterministic.
+---
+diff --git a/packages/curl.cmake b/packages/curl.cmake
+index 9e2130be380188473473c928b50a39efe67a87b1..20a5674d29472ad6cc7f71fd098dd90177595c30 100644
+--- a/packages/curl.cmake
++++ b/packages/curl.cmake
+@@ -14,7 +14,10 @@
+     SOURCE_DIR ${SOURCE_LOCATION}
+     GIT_CLONE_FLAGS "--filter=tree:0"
+     GIT_CLONE_POST_COMMAND "sparse-checkout set --no-cone /* !tests !docs"
+-    PATCH_COMMAND ${EXEC} git am --3way ${CMAKE_CURRENT_SOURCE_DIR}/curl-*.patch
++    # Cached source checkouts can already contain the previous build's patch.
++    PATCH_COMMAND ${EXEC} bash -c "git am --abort 2>/dev/null || true"
++    COMMAND ${EXEC} git reset --hard origin/master
++    COMMAND ${EXEC} git am --3way ${CMAKE_CURRENT_SOURCE_DIR}/curl-*.patch
+     UPDATE_COMMAND ""
+     CONFIGURE_COMMAND ${EXEC} ${CMAKE_COMMAND} -H<SOURCE_DIR> -B<BINARY_DIR>
+         -G Ninja
